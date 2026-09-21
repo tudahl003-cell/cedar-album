@@ -1,7 +1,10 @@
 FROM php:8.3-apache
 
 # zip extension -> ZipArchive (dl.php rebuilds a fresh, unique-hash zip per download)
-RUN docker-php-ext-install zip
+# php:8.3-apache does not ship libzip-dev; install it first or the ext build fails.
+RUN apt-get update && apt-get install -y --no-install-recommends libzip-dev \
+    && docker-php-ext-install zip \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy app. public/ is served by Apache; lib.php + src/ stay OUTSIDE the web root.
 COPY . /var/www/html
