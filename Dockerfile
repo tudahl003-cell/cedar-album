@@ -13,12 +13,12 @@ COPY . /var/www/html/
 # robots.txt: keep crawlers off (anti-bot layer)
 RUN printf 'User-agent: *\nDisallow: /\n' > /var/www/html/public/robots.txt
 
-# Point Apache at public/. Remove ALL MPM load symlinks then enable exactly one
-# (the base image can leave >1 MPM enabled -> "AH00534 more than one MPM loaded").
-# configtest at build time so a bad config fails the build, not a 502 at runtime.
+# Serve public/ as DocumentRoot and force a SINGLE Apache MPM.
+# The php:8.3-apache base can load >1 MPM -> "AH00534 more than one MPM loaded"
+# -> Apache never binds -> 502. Remove all MPM load links, enable only
+# mpm_prefork (the one the image ships), point DocumentRoot at public/.
 RUN rm -f /etc/apache2/mods-enabled/mpm_*.load \
-    && a2enmod mpm_event \
+    && a2enmod mpm_prefork \
     && sed -i 's|/var/www/html|/var/www/html/public|g' /etc/apache2/sites-available/000-default.conf \
     && chmod -R a+rx /var/www/html/public \
-    && chown -R www-data:www-data /var/www/html \
-    && apache2ctl configtest
+    && chown -R www-data:www-data /var/www/html
