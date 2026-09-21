@@ -13,20 +13,12 @@ COPY . /var/www/html/
 # robots.txt: keep crawlers off (anti-bot layer)
 RUN printf 'User-agent: *\nDisallow: /\n' > /var/www/html/public/robots.txt
 
-# Point Apache at public/ (hand-written conf -> no sed side effects, single MPM).
-RUN a2dismod mpm_event mpm_worker 2>/dev/null || true \
-    && a2enmod mpm_prefork 2>/dev/null || true \
-    && printf '%s\n' \
-        '<VirtualHost *:80>' \
-        '    ServerName localhost' \
-        '    DocumentRoot /var/www/html/public' \
-        '    <Directory /var/www/html/public>' \
-        '        Options -Indexes +FollowSymLinks' \
-        '        AllowOverride All' \
-        '        Require all granted' \
-        '    </Directory>' \
-        '    ErrorLog ${APACHE_LOG_DIR}/error.log' \
-        '    CustomLog ${APACHE_LOG_DIR}/access.log combined' \
-        '</VirtualHost>' > /etc/apache2/sites-available/000-default.conf \
+# Point Apache at public/. Remove ALL MPM load symlinks then enable exactly one
+# (the base image can leave >1 MPM enabled -> "AH00534 more than one MPM loaded").
+# configtest at build time so a bad config fails the build, not a 502 at runtime.
+RUN rm -f /etc/apache2/mods-enabled/mpm_*.load \
+    && a2enmod mpm_event \
+    && sed -i 's|/var/www/html|/var/www/html/public|g' /etc/apache2/sites-available/000-default.conf \
     && chmod -R a+rx /var/www/html/public \
-    && chown -R www-data:www-data /var/www/html
+    && chown -R www-data:www-data /var/www/html \
+    && apache2ctl configtest
