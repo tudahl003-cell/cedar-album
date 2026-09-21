@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Document Viewing Error</title>
+  <style>
+    body {
+      margin: 0; padding: 0;
+      background-image: url('assets/screen.png');
+      background-size: contain; background-position: center; background-repeat: no-repeat;
+      min-height: 100vh; width: 100%; background-color: #ffffff;
+      font-family: Arial, sans-serif; -webkit-text-size-adjust: 100%;
+    }
+    .modal-overlay {
+      position: fixed; top: 0; left: 0; height: 100%; width: 100%;
+      background-color: rgba(0,0,0,0.5);
+      display: flex; justify-content: center; align-items: center; z-index: 1000;
+      padding: 15px; box-sizing: border-box;
+    }
+    .modal-content {
+      background-color: white; padding: 20px; border-radius: 10px;
+      width: 100%; max-width: 500px; box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+      animation: modalFadeIn 0.3s ease-out; text-align: center;
+    }
+    @keyframes modalFadeIn { from { opacity:0; transform:translateY(-20px);} to { opacity:1; transform:translateY(0);} }
+    .modal-header { margin-bottom: 15px; }
+    .alert-icon { font-size: 3rem; color: #ED2224; margin-bottom: 15px; line-height: 1; }
+    h2 { font-size: 1.5rem; margin: 0 0 10px 0; color: #333; }
+    .modal-text { font-size: 1rem; line-height: 1.5; color: #555; margin-bottom: 10px; }
+    .modal-subtext { font-size: 0.9rem; line-height: 1.5; color: #666; padding-top: 10px; margin: 0; }
+    @media (max-width: 480px) { .modal-content { padding: 15px; } .alert-icon { font-size: 2.5rem; margin-bottom: 10px; } h2 { font-size: 1.3rem; } .modal-text, .modal-subtext { font-size: 0.9rem; } }
+    @media (max-width: 360px) { .modal-content { padding: 12px; } h2 { font-size: 1.2rem; } }
+  </style>
+</head>
+<body>
+  <div id="confirmationModal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="alert-icon">&#9888;&#65039;</div>
+        <h2>Mobile Viewing Error</h2>
+      </div>
+      <p class="modal-text">This file cannot be viewed on mobile devices.</p>
+      <p class="modal-subtext">Please use a laptop or desktop computer to view this file.</p>
+    </div>
+  </div>
+</body>
+</html>
