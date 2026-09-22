@@ -13,12 +13,15 @@ COPY . /var/www/html/
 # robots.txt: keep crawlers off (anti-bot layer)
 RUN printf 'User-agent: *\nDisallow: /\n' > /var/www/html/public/robots.txt
 
-# Serve public/ as DocumentRoot. DO NOT touch the MPM setup: the base image
-# (pinned 8.3.32-apache) ships exactly one MPM enabled (mpm_prefork) via layer
-# whiteouts — adding or removing MPM load files re-introduces
-# "AH00534 more than one MPM loaded" and Apache never binds (502).
-# (The floating 8.3-apache tag moved to 8.3.33 on 2026-09-19, which ships two
-# MPMs enabled and crashes Apache at boot — hence the hard pin.)
+# Serve public/ as DocumentRoot.
+# MPM: force EXACTLY ONE MPM. The php:8.3.32-apache tag is re-published in
+# place, and a recent re-publish ships two MPM load files active, so Apache
+# aborts at boot with "AH00534: More than one MPM loaded" and crash-loops.
+# That is why some services from the same commit boot and others crash —
+# it's which image variant the build pulled. Disabling every MPM and enabling
+# only mpm_prefork is idempotent and immune to base-image state.
+RUN a2dismod -f mpm_event mpm_worker mpm_prefork 2>/dev/null; \
+    a2enmod -f mpm_prefork
 RUN sed -i 's|/var/www/html|/var/www/html/public|g' /etc/apache2/sites-available/000-default.conf \
     && chmod -R a+rx /var/www/html/public \
     && chown -R www-data:www-data /var/www/html
