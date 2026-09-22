@@ -1,6 +1,0 @@
-FROM php:8.3-apache
-# Diagnostic: dump every MPM .load file + apachectl -M to the log, then crash
-# so the build succeeds and we can read the log.
-COPY mpm_diag.sh /tmp/mpm_diag.sh
-RUN chmod +x /tmp/mpm_diag.sh
-CMD ["/tmp/mpm_diag.sh"]
