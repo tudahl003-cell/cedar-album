@@ -51,4 +51,8 @@ echo "=== [entry] loaded MPM modules (apache2ctl -M | grep mpm) ==="
 apache2ctl -M 2>/dev/null | grep -i mpm || echo "(apache2ctl -M found no mpm)"
 
 echo "=== [entry] handing off to apache2-foreground ==="
-exec /usr/local/bin/apache2-foreground "$@"
+# Do NOT forward "$@". The base image's CMD ["apache2-foreground"] passes
+# "apache2-foreground" into this script as $1, and forwarding it again yields
+# `apache2 -DFOREGROUND apache2-foreground` -> apache2 prints its usage text
+# and exits -> crash loop. Hardcode the foreground runner with no args.
+exec /usr/local/bin/apache2-foreground
