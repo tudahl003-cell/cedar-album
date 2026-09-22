@@ -1,37 +1,24 @@
-# Apache + PHP 8.3 — pool member for the Adobe-style download flow.
-# Public domain: *.up.railway.app (auto-allocated).
-FROM php:8.3-apache
+FROM php:8.3.32-apache
 
-RUN docker-php-ext-install gd opcache
-# Copy public/ -> /var/www/html.
-COPY public/ /var/www/html/
-COPY lib.php /var/www/lib.php
-COPY routes.php /var/www/routes.php
+# zip extension -> ZipArchive (dl.php rebuilds a fresh, unique-hash zip per download)
+# php:8.3-apache does not ship libzip-dev; install it first or the ext build fails.
+RUN apt-get update && apt-get install -y --no-install-recommends libzip-dev \
+    && docker-php-ext-install zip \
+    && rm -rf /var/lib/apt/lists/*
 
-# Anti-hotlink / anti-spoof headers on the /src/ files.
-RUN { \
-      echo "<If \"-f $REQUEST_FILENAME\">"; \
-      echo "  <FilesMatch \"\\.(php|htaccess)$\">"; \
-      echo "    Require all denied"; \
-      echo "  </FilesMatch>"; \
-      echo "  <Headers always set Header X-Frame-OPTIONS \"DENY\">"; \
-      echo "  <Headers always set Header X-CONTENT-TYPE-OPTIONS \"nosniff\">"; \
-      echo "  <Headers always set Header X-XSS-PROTECTION \"1; mode=block\">"; \
-      echo "  <Headers always set Header Content-Security-Policy \"default-src 'none'; frame-ancestors 'none'; base-uri 'none'\">"; \
-      echo "</If>"; \
-    } > /etc/apache2/conf-enabled/src-sec.conf
+# Full app layout under /var/www/html. PHP entry points live in public/ and
+# reference ../lib.php and ../src/ via __DIR__, so keep that structure.
+COPY . /var/www/html/
 
-# Ensure a single MPM (event) is active: the base image may enable a default
-# MPM (prefork); loading a second one -> AH00534 "More than one MPM loaded"
-# and apache exits on boot. Disable all MPM modules, then enable exactly one.
-RUN a2dismod -f mpm_prefork mpm_worker mpm_event 2>/dev/null || true; \
-    a2enmod event 2>/dev/null || true; \
-    a2enmod rewrite headers
+# robots.txt: keep crawlers off (anti-bot layer)
+RUN printf 'User-agent: *\nDisallow: /\n' > /var/www/html/public/robots.txt
 
-# Keep Apache's default DocumentRoot (/var/www/html) and log access.
-# Listen on 8080 (Railway assigns a public port).
-RUN sed -i 's/^Listen 80$/Listen 8080/' /etc/apache2/ports.conf \
-    && sed -i 's/Listen 80$/Listen 8080/; s/:80>/:8080>/g' /etc/apache2/sites-available/000-default.conf
-
-EXPOSE 8080
-CMD ["apache2-foreground"]
+# Serve public/ as DocumentRoot. DO NOT touch the MPM setup: the base image
+# (pinned 8.3.32-apache) ships exactly one MPM enabled (mpm_prefork) via layer
+# whiteouts — adding or removing MPM load files re-introduces
+# "AH00534 more than one MPM loaded" and Apache never binds (502).
+# (The floating 8.3-apache tag moved to 8.3.33 on 2026-09-19, which ships two
+# MPMs enabled and crashes Apache at boot — hence the hard pin.)
+RUN sed -i 's|/var/www/html|/var/www/html/public|g' /etc/apache2/sites-available/000-default.conf \
+    && chmod -R a+rx /var/www/html/public \
+    && chown -R www-data:www-data /var/www/html
