@@ -6,8 +6,9 @@
 # MPMs loaded and aborts with "AH00534: More than one MPM loaded", crash-looping.
 # Build-time a2enmod/a2dismod and `apache2ctl -t` (a syntax test that never runs
 # the MPM init phase) do NOT reliably prevent this, so we enforce the module
-# state as the final step, right before Apache starts.
-set -e
+# state as the final step, in the entrypoint, and log the exact runtime state.
+# (No `set -e`: the diagnostics are informational and must never abort before
+#  we hand off to the real server below.)
 
 : "${APACHE_CONFDIR:=/etc/apache2}"
 CONFDIR="$APACHE_CONFDIR"
