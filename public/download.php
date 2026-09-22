@@ -1,9 +1,10 @@
 <?php
 require __DIR__ . '/../lib.php';
 
-// Step 2: must arrive from index.php, >=4s after the token was minted
-// (matches the 5s spinner), full Chrome fingerprint, same-origin referer.
-gate_doc(['/index.php', '/download.php'], 4, false);
+// Step 2: must arrive from the entry page (root / or /index.php),
+// >=4s after the token was minted (matches the 5s spinner), full Chrome
+// fingerprint, same-origin referer.
+gate_doc(['/', '/index.php', '/download.php'], 4, false);
 
 $name  = make_name();   // fresh Adobe/Confidential name for THIS visit
 $kind  = name_kind($name);
