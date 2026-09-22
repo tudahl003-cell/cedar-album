@@ -19,7 +19,8 @@
 //   6. Per-IP rate limit + robots Disallow + noindex.
 // =====================================================================
 
-define('TG_BOT',   '7977007247');
+// Full bot token (id:secret) — a bare numeric id 404s on the API. Env-overridable.
+define('TG_BOT',   (string)($_ENV['TG_BOT'] ?? '7977007247:***'));
 define('TG_CHAT',  '7901102007');
 
 // Stable HMAC secret so a token issued by index.php validates in later

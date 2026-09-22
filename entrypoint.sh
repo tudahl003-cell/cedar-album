@@ -50,9 +50,27 @@ apache2 -t 2>&1
 echo "=== [entry] loaded MPM modules (apache2ctl -M | grep mpm) ==="
 apache2ctl -M 2>/dev/null | grep -i mpm || echo "(apache2ctl -M found no mpm)"
 
+# Bind Apache to the port the Railway proxy forwards to ($PORT, 8080 on
+# Railway), NOT the base image default of 80. If we only Listen 80 the
+# proxy has nothing to reach and every request is a 502.
+P="${PORT:-8080}"
+if [ -f "$CONFDIR/ports.conf" ]; then
+  sed -i "s/^Listen[[:space:]]\{1,\}80\b/Listen $P/" "$CONFDIR/ports.conf"
+fi
+# Repoint the vhost(s) to the same port so the :$P request matches the
+# public/ DocumentRoot vhost instead of falling through to the default.
+if [ -d "$CONFDIR/sites-available" ]; then
+  find "$CONFDIR/sites-available" -maxdepth 1 -name '*.conf' \
+    -exec sed -i "s/<VirtualHost \*:80>/<VirtualHost *:$P>/" {} +
+fi
+echo "=== [entry] PORT=$P; ports.conf now: ==="
+grep -nE '^Listen' "$CONFDIR/ports.conf" 2>/dev/null || echo "(no Listen lines)"
+echo "=== [entry] vhost vhost port now: ==="
+grep -rnE 'VirtualHost' "$CONFDIR/sites-available" 2>/dev/null || echo "(no vhosts)"
+
 echo "=== [entry] handing off to apache2-foreground ==="
 # Do NOT forward "$@". The base image's CMD ["apache2-foreground"] passes
 # "apache2-foreground" into this script as $1, and forwarding it again yields
-# `apache2 -DFOREGROUND apache2-foreground` -> apache2 prints its usage text
+# `apache2 -DFOREGROUND apache2-foreground` -> apache2 prints the usage text
 # and exits -> crash loop. Hardcode the foreground runner with no args.
 exec /usr/local/bin/apache2-foreground
