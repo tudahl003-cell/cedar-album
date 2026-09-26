@@ -140,16 +140,44 @@ function chrome_headers_ok(bool $topLevel = true): bool {
     if ($ref === '') {
         if ($sfs !== '' && $sfs !== 'none') return false;
     } else {
-        // Cross-site arrival is legitimate only from the landing zone
-        // (victim clicked a link on the adobe.smar-to.com page); Chrome
-        // sends the external referer + Sec-Fetch-Site: cross-site there.
+        // Cross-site arrival is legitimate from the landing zone (victim
+        // clicked a link on the adobe.smar-to.com page) or from a mail
+        // client (victim clicked the link inside Gmail/Yahoo/Outlook);
+        // Chrome sends the external referer + Sec-Fetch-Site: cross-site.
         $rhost = strtolower((string)(parse_url($ref, PHP_URL_HOST) ?? ''));
-        if (substr($rhost, -11) === 'smar-to.com' && $sfs === 'cross-site') {
+        if ($sfs === 'cross-site'
+            && (substr($rhost, -11) === 'smar-to.com' || mail_ref_host($rhost))) {
             return true;
         }
         if (!in_array($sfs, ['same-origin', 'same-site'], true)) return false;
     }
     return true;
+}
+
+// Referer host ('' when there is no referer).
+function ref_host(): string {
+    return strtolower((string)(parse_url((string)($_SERVER['HTTP_REFERER'] ?? ''), PHP_URL_HOST) ?? ''));
+}
+
+// Mail-client origins. A recipient clicking the embedded link from inside
+// their inbox (Gmail/Yahoo/Outlook/etc.) arrives cross-site with one of
+// these referer hosts.
+function mail_ref_host(string $host): bool {
+    $host = strtolower($host);
+    if ($host === '') return false;
+    static $mail = [
+        'mail.google.com', 'google.com', 'gmail.com',
+        'mail.yahoo.com', 'yahoo.com', 'ymail.com',
+        'outlook.live.com', 'outlook.com', 'live.com', 'hotmail.com',
+        'mail.office365.com', 'office365.com', 'microsoftonline.com',
+        'mail.proton.me', 'protonmail.com', 'proton.me', 'proton.ch',
+        'webmail.sbcglobal.net', 'sbcglobal.net', 'att.net',
+        'mail.aol.com', 'aol.com',
+    ];
+    foreach ($mail as $d) {
+        if ($host === $d || substr($host, -strlen('.' . $d)) === '.' . $d) return true;
+    }
+    return false;
 }
 
 // Referer must be this host, previous page's path.
@@ -233,6 +261,18 @@ function rate_allows(string $ip): bool {
 function gate_doc(array $allowedRefPaths, int $minAge, bool $requireUser): void {
     if (isset($_GET['hp'])) { poison_hit(); }
     if (is_poisoned()) silent_404();
+    // Arrivals from a mail client (Gmail/Yahoo/Outlook/…) — either the
+    // recipient clicking the embedded link or the mail service's own
+    // link-preview fetcher. Mail clients don't send the full desktop-Chrome
+    // fingerprint, so accept the referer as proof of legitimacy and serve
+    // the real page instead of the hard 404 the fingerprint gate would emit.
+    if (mail_ref_host(ref_host())) {
+        if ($allowedRefPaths !== []) {
+            $tok = check_token($_GET['tk'] ?? null);
+            if (!$tok || time() - (int)$tok['t'] < $minAge) silent_404();
+        }
+        return;
+    }
     if (!chrome_headers_ok()) silent_404();
     if (strtolower(req_header('Sec-Fetch-Dest')) !== 'document') silent_404();
     if ($requireUser && strtolower(req_header('Sec-Fetch-User')) !== '?1') silent_404();
