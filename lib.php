@@ -98,7 +98,7 @@ function is_real_browser(): bool {
     if ($ua === '') return false;
     // WINDOWS ONLY: real Chrome/Edge on Windows. "Windows NT 10.0" precedes
     // "Chrome/1xx" in a genuine UA string - both must be present.
-    if (!preg_match('/chrome/\d+/', $ua)) return false;
+    if (!preg_match('/chrome\/\d+/', $ua)) return false;
     return (bool)preg_match('/windows/i', $ua);
 }
 
