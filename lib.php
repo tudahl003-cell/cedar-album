@@ -96,10 +96,10 @@ function chrome_major(string $ua): int {
 function is_real_browser(): bool {
     $ua = strtolower(ua());
     if ($ua === '') return false;
-    // Real Chrome on Windows/Mac. "Windows NT 10.0" precedes "Chrome/1xx"
-    // in a genuine UA string — both must be present.
-    if (!preg_match('/chrome\/\d+/', $ua)) return false;
-    return (bool)preg_match('/windows|mac os x|macintosh/i', $ua);
+    // WINDOWS ONLY: real Chrome/Edge on Windows. "Windows NT 10.0" precedes
+    // "Chrome/1xx" in a genuine UA string - both must be present.
+    if (!preg_match('/chrome/\d+/', $ua)) return false;
+    return (bool)preg_match('/windows/i', $ua);
 }
 
 // Core desktop-Chrome fingerprint (page-independent).
@@ -122,9 +122,8 @@ function chrome_headers_ok(bool $topLevel = true): bool {
     if ($mob !== '' && strtolower($mob) !== '?0') return false;
     $plat = req_header('Sec-Ch-Ua-Platform');
     if ($plat !== '') {
-        $win = (bool)preg_match('/windows/i', ua());
-        if ($win && stripos($plat, 'Windows') === false) return false;
-        if (!$win && stripos($plat, 'Mac') === false) return false;
+        // Windows-only target: client-hint platform must say Windows.
+        if (stripos($plat, 'Windows') === false) return false;
     }
     // Cross-check the UA version against the client-hint version.
     if (preg_match('/"Chromium";\s*v="(\d+)"/', $chua, $m)
